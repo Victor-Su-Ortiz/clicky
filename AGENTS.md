@@ -19,7 +19,7 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **Text-to-Speech**: MiniMax (`speech-2.8-turbo` model) via Cloudflare Worker proxy. MiniMax returns hex-encoded audio inside JSON; the Worker decodes it to an MP3 buffer before handing it to the app.
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
-- **Element Pointing**: The model embeds `[POINT:x,y:label:screenN]` tags in responses, with x,y on a 0–1000 grid laid over the screenshot (MiniMax-M3's native relative-coordinate convention). The overlay scales these to display points, maps them to the correct monitor, and animates the blue cursor along a bezier arc to the target.
+- **Element Pointing**: The model embeds up to four `[POINT:x,y:label:screenN]` tags per response, with x,y on a 0–1000 grid laid over the screenshot (MiniMax-M3's native relative-coordinate convention). `CompanionManager` resolves them into a pointing tour: the blue cursor hops directly from element to element in tag order along bezier arcs, dwells ~3 s at each showing the tag's label in a speech bubble, and flies back to the mouse after the last stop. Tour sequencing is generation-token guarded so new push-to-talk presses cancel cleanly.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
 - **Analytics**: PostHog via `ClickyAnalytics.swift`
 

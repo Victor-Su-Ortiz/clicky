@@ -165,6 +165,24 @@ struct BlueCursorView: View {
     /// Only during the return flight can cursor movement cancel the animation.
     @State private var isReturningToCursor: Bool = false
 
+    /// Bumped at the start of every navigation leg and on every reset. The
+    /// dwell and character-stream closures are asyncAfter blocks that can't
+    /// be invalidated — they capture this value and bail when a newer leg
+    /// has started in the meantime.
+    @State private var navigationLegGeneration: Int = 0
+
+    /// The companion manager's tour generation captured when this leg started,
+    /// passed back in advancePointingTourAfterDwell so a leg from a cancelled
+    /// tour can't advance a newer tour.
+    @State private var tourGenerationForCurrentLeg: Int = 0
+
+    /// True between a dwell completion publishing the next tour stop and the
+    /// next leg actually starting. If the tour is cancelled inside that gap,
+    /// SwiftUI coalesces stop → nil into a single nil change and this view has
+    /// no pending closures left to recover it — the onChange observer's nil
+    /// branch uses this flag to fly the buddy home instead of stranding it.
+    @State private var isAwaitingNextTourLeg: Bool = false
+
     // MARK: - Onboarding Video Layout
 
     private let onboardingVideoPlayerWidth: CGFloat = 330
@@ -373,12 +391,28 @@ struct BlueCursorView: View {
             // that position so it points at the element.
             guard let screenLocation = newLocation,
                   let displayFrame = companionManager.detectedElementDisplayFrame else {
+                // The tour was cancelled in the gap between a leg's dwell
+                // publishing the next stop and this observer delivering it.
+                // The leg has no pending closures left to recover it, so fly
+                // home now. (Other nil deliveries — e.g. a cancel while dwell
+                // closures are still pending — recover via those closures.)
+                if isAwaitingNextTourLeg {
+                    isAwaitingNextTourLeg = false
+                    startFlyingBackToCursor()
+                }
                 return
             }
 
             // Only navigate if the target is on THIS screen
             guard screenFrame.contains(CGPoint(x: displayFrame.midX, y: displayFrame.midY))
                   || displayFrame == screenFrame else {
+                // A tour leg moved to a different screen while this view was
+                // mid-flight or pointing. Clean up locally (timers, bubble,
+                // mode) WITHOUT clearing the manager's published location —
+                // the new screen's view needs it to run its own leg.
+                if buddyNavigationMode != .followingCursor {
+                    resetNavigationStateToFollowCursor()
+                }
                 return
             }
 
@@ -477,6 +511,13 @@ struct BlueCursorView: View {
         // moves the mouse enough to cancel the return flight
         let mouseLocation = NSEvent.mouseLocation
         cursorPositionWhenNavigationStarted = convertScreenPointToSwiftUICoordinates(mouseLocation)
+
+        // Start a new navigation leg: invalidate the pending dwell/stream
+        // closures of any previous leg and remember which tour this leg
+        // belongs to for the advance call after the dwell.
+        navigationLegGeneration += 1
+        tourGenerationForCurrentLeg = companionManager.pointingTourGeneration
+        isAwaitingNextTourLeg = false
 
         // Enter navigation mode — stop cursor following
         buddyNavigationMode = .navigatingToTarget
@@ -587,14 +628,28 @@ struct BlueCursorView: View {
             ?? navigationPointerPhrases.randomElement()
             ?? "right here!"
 
-        streamNavigationBubbleCharacter(phrase: pointerPhrase, characterIndex: 0) {
-            // All characters streamed — hold for 3 seconds, then fly back
+        let legGeneration = navigationLegGeneration
+
+        streamNavigationBubbleCharacter(phrase: pointerPhrase, characterIndex: 0, legGeneration: legGeneration) {
+            // All characters streamed — hold for 3 seconds, then advance the tour
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                guard self.buddyNavigationMode == .pointingAtTarget else { return }
+                guard self.buddyNavigationMode == .pointingAtTarget,
+                      self.navigationLegGeneration == legGeneration else { return }
                 self.navigationBubbleOpacity = 0.0
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    guard self.buddyNavigationMode == .pointingAtTarget else { return }
-                    self.startFlyingBackToCursor()
+                    guard self.buddyNavigationMode == .pointingAtTarget,
+                          self.navigationLegGeneration == legGeneration else { return }
+                    switch self.companionManager.advancePointingTourAfterDwell(tourGeneration: self.tourGenerationForCurrentLeg) {
+                    case .advancedToNextStop:
+                        // The manager published the next stop — the onChange
+                        // observer on the correct screen (possibly this one)
+                        // starts the next leg. Do not fly home, but flag the
+                        // gap so a cancellation landing before that onChange
+                        // can still recover this view (see the nil branch).
+                        self.isAwaitingNextTourLeg = true
+                    case .tourFinished:
+                        self.startFlyingBackToCursor()
+                    }
                 }
             }
         }
@@ -605,9 +660,11 @@ struct BlueCursorView: View {
     private func streamNavigationBubbleCharacter(
         phrase: String,
         characterIndex: Int,
+        legGeneration: Int,
         onComplete: @escaping () -> Void
     ) {
-        guard buddyNavigationMode == .pointingAtTarget else { return }
+        guard buddyNavigationMode == .pointingAtTarget,
+              navigationLegGeneration == legGeneration else { return }
         guard characterIndex < phrase.count else {
             onComplete()
             return
@@ -626,6 +683,7 @@ struct BlueCursorView: View {
             self.streamNavigationBubbleCharacter(
                 phrase: phrase,
                 characterIndex: characterIndex + 1,
+                legGeneration: legGeneration,
                 onComplete: onComplete
             )
         }
@@ -649,27 +707,37 @@ struct BlueCursorView: View {
 
     /// Cancels an in-progress navigation because the user moved the cursor.
     private func cancelNavigationAndResumeFollowing() {
-        navigationAnimationTimer?.invalidate()
-        navigationAnimationTimer = nil
-        navigationBubbleText = ""
-        navigationBubbleOpacity = 0.0
-        navigationBubbleScale = 1.0
-        buddyFlightScale = 1.0
         finishNavigationAndResumeFollowing()
     }
 
-    /// Returns the buddy to normal cursor-following mode after navigation completes.
-    private func finishNavigationAndResumeFollowing() {
+    /// Resets all local navigation state back to cursor-following WITHOUT
+    /// touching the manager's published target. Used both when a leg finishes
+    /// on this screen and when a tour leg hands off to a different screen
+    /// (where the manager's location must stay intact for the other view).
+    private func resetNavigationStateToFollowCursor() {
+        // Invalidate the pending dwell/stream closures of the current leg
+        navigationLegGeneration += 1
         navigationAnimationTimer?.invalidate()
         navigationAnimationTimer = nil
         buddyNavigationMode = .followingCursor
         isReturningToCursor = false
+        isAwaitingNextTourLeg = false
         triangleRotationDegrees = -35.0
         buddyFlightScale = 1.0
         navigationBubbleText = ""
         navigationBubbleOpacity = 0.0
         navigationBubbleScale = 1.0
-        companionManager.clearDetectedElementLocation()
+    }
+
+    /// Returns the buddy to normal cursor-following mode after navigation completes.
+    private func finishNavigationAndResumeFollowing() {
+        resetNavigationStateToFollowCursor()
+        // Only clear the manager's published target if it still belongs to
+        // the tour this leg was part of — a newer tour may already be running
+        // (possibly on another screen) and needs its location left intact.
+        if companionManager.pointingTourGeneration == tourGenerationForCurrentLeg {
+            companionManager.clearDetectedElementLocation()
+        }
     }
 
     // MARK: - Welcome Animation

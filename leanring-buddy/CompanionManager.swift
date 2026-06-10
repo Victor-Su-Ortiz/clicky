@@ -42,6 +42,35 @@ final class CompanionManager: ObservableObject {
     /// BlueCursorView uses this instead of a random pointer phrase.
     @Published var detectedElementBubbleText: String?
 
+    // MARK: - Pointing Tour State
+
+    /// One stop on a pointing tour, pre-resolved to global AppKit coordinates.
+    struct PointingTourStop {
+        let screenLocation: CGPoint
+        let displayFrame: CGRect
+        /// Bubble text shown at this stop (the tag's label, or the onboarding
+        /// demo's comment). Nil makes the overlay use a random pointer phrase.
+        let bubbleText: String?
+    }
+
+    /// What the overlay should do after a stop's dwell completes.
+    enum PointingTourAdvanceResult {
+        /// The next stop was published — the onChange observer on the correct
+        /// screen starts the next leg; the calling view must NOT fly home.
+        case advancedToNextStop
+        /// No stops remain — the calling view flies back to the user's cursor.
+        case tourFinished
+    }
+
+    /// Tour stops not yet visited (the currently published stop is excluded).
+    private var pendingPointingTourStops: [PointingTourStop] = []
+
+    /// Monotonic token identifying the active tour. Bumped on every new tour
+    /// and on cancellation so dwell completions from a cancelled tour's leg
+    /// can't advance a newer tour — the overlay's asyncAfter dwell closures
+    /// can't be invalidated, only ignored.
+    private(set) var pointingTourGeneration: Int = 0
+
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
     @Published var onboardingVideoPlayer: AVPlayer?
@@ -125,6 +154,10 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
         } else {
+            // Cancel any running pointing tour first — hiding the overlay
+            // destroys the views before any of them can clear the published
+            // location, which would leave an invisible buddy on re-enable.
+            cancelPointingTour()
             overlayWindowManager.hideOverlay()
             isOverlayVisible = false
         }
@@ -202,6 +235,11 @@ final class CompanionManager: ObservableObject {
         // Play Besaid theme at 60% volume, fade out after 1m 30s
         startOnboardingMusic()
 
+        // Cancel any running pointing tour before showOverlay tears down the
+        // overlay views — destroyed views can't clear the published location,
+        // which would leave the buddy invisible on the fresh views.
+        cancelPointingTour()
+
         // Show the overlay for the first time — isFirstAppearance triggers
         // the welcome animation and onboarding video
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
@@ -215,6 +253,11 @@ final class CompanionManager: ObservableObject {
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
         ClickyAnalytics.trackOnboardingReplayed()
         startOnboardingMusic()
+        // Cancel any running pointing tour before showOverlay tears down the
+        // overlay views — destroyed views can't clear the published location,
+        // which would leave the buddy invisible for the whole replay (and
+        // push-to-talk recovery is blocked while the video plays).
+        cancelPointingTour()
         // Tear down any existing overlays and recreate with isFirstAppearance = true
         overlayWindowManager.hasShownOverlayBefore = false
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
@@ -273,14 +316,58 @@ final class CompanionManager: ObservableObject {
     }
 
     func clearDetectedElementLocation() {
+        // A nil location with queued stops would strand the tour, so clearing
+        // the location always ends the tour as well.
+        pendingPointingTourStops.removeAll()
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
     }
 
+    // MARK: - Pointing Tour Control
+
+    /// Begins a pointing tour: publishes the first stop (which triggers the
+    /// overlay's flight animation) and queues the remaining stops.
+    private func startPointingTour(_ stops: [PointingTourStop]) {
+        guard let firstStop = stops.first else { return }
+        pointingTourGeneration += 1
+        pendingPointingTourStops = Array(stops.dropFirst())
+        publishPointingTourStop(firstStop)
+    }
+
+    /// Called by BlueCursorView when a stop's dwell completes. The view passes
+    /// the tour generation captured when its leg started; a stale generation
+    /// (the tour was cancelled or replaced mid-leg) is treated as finished so
+    /// the stale leg flies home without touching the newer tour.
+    func advancePointingTourAfterDwell(tourGeneration: Int) -> PointingTourAdvanceResult {
+        guard tourGeneration == pointingTourGeneration,
+              !pendingPointingTourStops.isEmpty else {
+            return .tourFinished
+        }
+        publishPointingTourStop(pendingPointingTourStops.removeFirst())
+        return .advancedToNextStop
+    }
+
+    /// Sets the bubble text and display frame BEFORE the location — the
+    /// overlay's onChange observer keys off the location and reads the
+    /// other two properties when it fires.
+    private func publishPointingTourStop(_ stop: PointingTourStop) {
+        detectedElementBubbleText = stop.bubbleText
+        detectedElementDisplayFrame = stop.displayFrame
+        detectedElementScreenLocation = stop.screenLocation
+    }
+
+    /// Cancels the whole tour: bumps the generation so in-flight dwell
+    /// completions can't advance, and clears the published target.
+    private func cancelPointingTour() {
+        pointingTourGeneration += 1
+        clearDetectedElementLocation()
+    }
+
     func stop() {
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
+        cancelPointingTour()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
 
@@ -482,10 +569,11 @@ final class CompanionManager: ObservableObject {
             // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-            // Cancel any in-progress response and TTS from a previous utterance
+            // Cancel any in-progress response, TTS, and pointing tour from a
+            // previous utterance
             currentResponseTask?.cancel()
             miniMaxTTSClient.stopPlayback()
-            clearDetectedElementLocation()
+            cancelPointingTour()
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -554,9 +642,11 @@ final class CompanionManager: ObservableObject {
 
     don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
 
-    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. coordinates use a 0 to 1000 grid laid over the screenshot: (0,0) is the top-left corner of the image and (1000,1000) is the bottom-right corner. x increases rightward, y increases downward. so the center of the screen is 500,500 and something near the top-right corner is around 950,50.
+    when you point, append coordinate tags at the very end of your response, AFTER your spoken text. coordinates use a 0 to 1000 grid laid over the screenshot: (0,0) is the top-left corner of the image and (1000,1000) is the bottom-right corner. x increases rightward, y increases downward. so the center of the screen is 500,500 and something near the top-right corner is around 950,50.
 
     format: [POINT:x,y:label] where x,y are integers from 0 to 1000 on that grid, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
+
+    you can point at up to FOUR elements in one response by writing multiple tags back to back, like [POINT:120,80:file menu][POINT:430,200:share button]. the cursor visits them in the order you write them and shows each label in a little speech bubble, so order them the way the user should look at them — first step first. most answers only need one tag. only use several when the user genuinely needs a sequence of places, like the steps of a workflow or a few related controls.
 
     if pointing wouldn't help, append [POINT:none].
 
@@ -565,8 +655,9 @@ final class CompanionManager: ObservableObject {
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:220,15:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:310,360:terminal:screen2]"
+    - user asks how to export a video in final cut: "head up to the file menu, then share, then export file in that submenu — i'll walk you through it. [POINT:60,15:file menu][POINT:140,200:share][POINT:300,260:export file]"
 
-    CRITICAL: every response must end with exactly one coordinate tag — either [POINT:x,y:label] or [POINT:none] — as the very last thing you write. exactly one tag, never more: if several elements are worth pointing at, pick the single most helpful one. the tag is stripped by software before your words are spoken aloud, so the user never hears it. never write anything after the tag, and never skip it.
+    CRITICAL: every response must end with coordinate tags — one to four [POINT:x,y:label] tags back to back, or a single [POINT:none] — as the very last thing you write. never more than four tags, and never mix [POINT:none] with coordinate tags. the tags are stripped by software before your words are spoken aloud, so the user never hears them. never write anything after the tags, and never skip them.
     """
 
     // MARK: - AI Response Pipeline
@@ -574,8 +665,8 @@ final class CompanionManager: ObservableObject {
     /// Captures a screenshot, sends it along with the transcript to MiniMax,
     /// and plays the response aloud via MiniMax TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
-    /// The model's response may include a [POINT:x,y:label] tag which triggers
-    /// the buddy to fly to that element on screen.
+    /// The model's response may include up to four [POINT:x,y:label] tags
+    /// which start a pointing tour — the buddy visits each element in order.
     private func sendTranscriptToMiniMaxWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         miniMaxTTSClient.stopPlayback()
@@ -608,7 +699,7 @@ final class CompanionManager: ObservableObject {
                 // history stores the raw transcript, so this reminder never
                 // accumulates across turns.
                 let userPromptWithPointingReminder = transcript
-                    + "\n\n(end your response with [POINT:x,y:label] or [POINT:none])"
+                    + "\n\n(end your response with one to four [POINT:x,y:label] tags or a single [POINT:none])"
 
                 let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
@@ -630,58 +721,46 @@ final class CompanionManager: ObservableObject {
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if the model returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
-                    voiceState = .idle
+                // Resolve each parsed point to a tour stop with global AppKit
+                // coordinates. Per-point screen selection: an explicit :screenN
+                // picks that capture, otherwise the cursor screen.
+                let resolvedStops: [PointingTourStop] = parseResult.points.compactMap { point in
+                    let targetScreenCapture: CompanionScreenCapture? = {
+                        if let screenNumber = point.screenNumber,
+                           screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                            return screenCaptures[screenNumber - 1]
+                        }
+                        return screenCaptures.first(where: { $0.isCursorScreen })
+                    }()
+                    guard let targetScreenCapture else { return nil }
+                    return PointingTourStop(
+                        screenLocation: Self.convertGridPointToGlobalScreenLocation(point.coordinate, on: targetScreenCapture),
+                        displayFrame: targetScreenCapture.displayFrame,
+                        bubbleText: point.elementLabel
+                    )
                 }
 
-                // Pick the screen capture matching the model's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
+                // Drop consecutive duplicate locations — SwiftUI's onChange only
+                // fires when the value actually changes, so publishing the same
+                // location twice in a row would stall the tour on that stop.
+                var tourStops: [PointingTourStop] = []
+                for stop in resolvedStops where tourStops.last?.screenLocation != stop.screenLocation {
+                    tourStops.append(stop)
+                }
+
+                if !tourStops.isEmpty {
+                    // Switch to idle BEFORE starting the tour so the triangle
+                    // becomes visible and can fly to the first target. Without
+                    // this, the spinner hides the triangle and the flight
+                    // animation is invisible.
+                    voiceState = .idle
+                    for point in parseResult.points {
+                        ClickyAnalytics.trackElementPointed(elementLabel: point.elementLabel)
                     }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
-
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // The model's coordinates are on a 0–1000 grid laid over
-                    // the screenshot (top-left origin). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let coordinateGridMax: CGFloat = 1000
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to the 0–1000 coordinate grid
-                    let clampedX = max(0, min(pointCoordinate.x, coordinateGridMax))
-                    let clampedY = max(0, min(pointCoordinate.y, coordinateGridMax))
-
-                    // Scale from the 0–1000 grid to display points
-                    let displayLocalX = clampedX * (displayWidth / coordinateGridMax)
-                    let displayLocalY = clampedY * (displayHeight / coordinateGridMax)
-
-                    // Convert from top-left origin (grid) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
-                    )
-
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    startPointingTour(tourStops)
+                    print("🎯 Pointing tour: \(tourStops.count) stop(s)")
                 } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                    print("🎯 Element pointing: no elements")
                 }
 
                 // Save this exchange to conversation history WITH its [POINT:...]
@@ -778,37 +857,49 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Point Tag Parsing
 
-    /// Result of parsing a [POINT:...] tag from the model's response.
-    struct PointingParseResult {
-        /// The response text with the [POINT:...] tag removed — this is what gets spoken.
-        let spokenText: String
-        /// The parsed 0–1000 grid coordinate, or nil if the model said "none" or no tag was found.
-        let coordinate: CGPoint?
-        /// Short label describing the element (e.g. "run button"), or "none".
+    /// A single parsed [POINT:x,y:label(:screenN)] coordinate tag.
+    struct ParsedPointTag {
+        /// The 0–1000 grid coordinate on the screenshot (top-left origin).
+        let coordinate: CGPoint
+        /// Short label describing the element (e.g. "run button"), or nil if omitted.
         let elementLabel: String?
         /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
         let screenNumber: Int?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the model's response.
-    /// The tag normally arrives at the very end of the response, but the model
-    /// occasionally writes it mid-sentence or adds trailing punctuation, so the
-    /// match is deliberately not anchored to the end of the text. Every tag is
-    /// stripped from the spoken text; the last tag wins if there are several.
-    /// Returns the spoken text (tags removed) and the optional coordinate + label + screen number.
+    /// Result of parsing the [POINT:...] tags from the model's response.
+    struct PointingParseResult {
+        /// The response text with every [POINT:...] tag removed — this is what gets spoken.
+        let spokenText: String
+        /// All coordinate tags in document order — the pointing tour visits
+        /// them in this order — capped at `maximumPointingTourStops`. Empty
+        /// when the model wrote [POINT:none] or no tag at all.
+        let points: [ParsedPointTag]
+    }
+
+    /// The maximum number of stops a pointing tour will visit. Tags beyond
+    /// this are dropped (tags are in visit order, so the first four are kept).
+    static let maximumPointingTourStops = 4
+
+    /// Parses every [POINT:x,y:label:screenN] tag from the model's response.
+    /// Tags normally arrive back to back at the very end of the response, but
+    /// the model occasionally writes them mid-sentence or adds trailing
+    /// punctuation, so matching is deliberately not anchored to the end of the
+    /// text. Every tag is stripped from the spoken text; [POINT:none] tags
+    /// contribute no points.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
         // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
         let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
+            return PointingParseResult(spokenText: responseText, points: [])
         }
 
         let fullTextRange = NSRange(responseText.startIndex..., in: responseText)
         let allTagMatches = regex.matches(in: responseText, range: fullTextRange)
-        guard let match = allTagMatches.last else {
+        guard !allTagMatches.isEmpty else {
             // No tag found at all
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
+            return PointingParseResult(spokenText: responseText, points: [])
         }
 
         // Remove every tag occurrence from the spoken text. Removing from the
@@ -821,30 +912,68 @@ final class CompanionManager: ObservableObject {
         }
         let spokenText = spokenTextWithTagsRemoved.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Check if it's [POINT:none]
-        guard match.numberOfRanges >= 3,
-              let xRange = Range(match.range(at: 1), in: responseText),
-              let yRange = Range(match.range(at: 2), in: responseText),
-              let x = Double(responseText[xRange]),
-              let y = Double(responseText[yRange]) else {
-            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil)
-        }
+        // Collect coordinate tags in document order. [POINT:none] matches have
+        // no captured x/y groups and contribute nothing.
+        var points: [ParsedPointTag] = []
+        for tagMatch in allTagMatches {
+            guard tagMatch.numberOfRanges >= 3,
+                  let xRange = Range(tagMatch.range(at: 1), in: responseText),
+                  let yRange = Range(tagMatch.range(at: 2), in: responseText),
+                  let x = Double(responseText[xRange]),
+                  let y = Double(responseText[yRange]) else {
+                continue
+            }
 
-        var elementLabel: String? = nil
-        if match.numberOfRanges >= 4, let labelRange = Range(match.range(at: 3), in: responseText) {
-            elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
-        }
+            var elementLabel: String? = nil
+            if tagMatch.numberOfRanges >= 4, let labelRange = Range(tagMatch.range(at: 3), in: responseText) {
+                elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
+            }
 
-        var screenNumber: Int? = nil
-        if match.numberOfRanges >= 5, let screenRange = Range(match.range(at: 4), in: responseText) {
-            screenNumber = Int(responseText[screenRange])
+            var screenNumber: Int? = nil
+            if tagMatch.numberOfRanges >= 5, let screenRange = Range(tagMatch.range(at: 4), in: responseText) {
+                screenNumber = Int(responseText[screenRange])
+            }
+
+            points.append(ParsedPointTag(
+                coordinate: CGPoint(x: x, y: y),
+                elementLabel: elementLabel,
+                screenNumber: screenNumber
+            ))
         }
 
         return PointingParseResult(
             spokenText: spokenText,
-            coordinate: CGPoint(x: x, y: y),
-            elementLabel: elementLabel,
-            screenNumber: screenNumber
+            points: Array(points.prefix(maximumPointingTourStops))
+        )
+    }
+
+    /// Converts a model coordinate on the 0–1000 screenshot grid (top-left
+    /// origin) to a global AppKit screen point (bottom-left origin) on the
+    /// captured display.
+    private static func convertGridPointToGlobalScreenLocation(
+        _ gridPoint: CGPoint,
+        on screenCapture: CompanionScreenCapture
+    ) -> CGPoint {
+        let coordinateGridMax: CGFloat = 1000
+        let displayWidth = CGFloat(screenCapture.displayWidthInPoints)
+        let displayHeight = CGFloat(screenCapture.displayHeightInPoints)
+        let displayFrame = screenCapture.displayFrame
+
+        // Clamp to the 0–1000 coordinate grid
+        let clampedX = max(0, min(gridPoint.x, coordinateGridMax))
+        let clampedY = max(0, min(gridPoint.y, coordinateGridMax))
+
+        // Scale from the 0–1000 grid to display points
+        let displayLocalX = clampedX * (displayWidth / coordinateGridMax)
+        let displayLocalY = clampedY * (displayHeight / coordinateGridMax)
+
+        // Convert from top-left origin (grid) to bottom-left origin (AppKit)
+        let appKitY = displayHeight - displayLocalY
+
+        // Convert display-local coords to global screen coords
+        return CGPoint(
+            x: displayLocalX + displayFrame.origin.x,
+            y: appKitY + displayFrame.origin.y
         )
     }
 
@@ -1016,33 +1145,19 @@ final class CompanionManager: ObservableObject {
 
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
 
-                guard let pointCoordinate = parseResult.coordinate else {
+                guard let firstPoint = parseResult.points.first else {
                     print("🎯 Onboarding demo: no element to point at")
                     return
                 }
 
-                // The model's coordinates are on a 0–1000 grid laid over the screenshot
-                let coordinateGridMax: CGFloat = 1000
-                let displayWidth = CGFloat(cursorScreenCapture.displayWidthInPoints)
-                let displayHeight = CGFloat(cursorScreenCapture.displayHeightInPoints)
-                let displayFrame = cursorScreenCapture.displayFrame
-
-                let clampedX = max(0, min(pointCoordinate.x, coordinateGridMax))
-                let clampedY = max(0, min(pointCoordinate.y, coordinateGridMax))
-                let displayLocalX = clampedX * (displayWidth / coordinateGridMax)
-                let displayLocalY = clampedY * (displayHeight / coordinateGridMax)
-                let appKitY = displayHeight - displayLocalY
-                let globalLocation = CGPoint(
-                    x: displayLocalX + displayFrame.origin.x,
-                    y: appKitY + displayFrame.origin.y
-                )
-
-                // Set custom bubble text so the pointing animation uses the model's
-                // comment instead of a random phrase
-                detectedElementBubbleText = parseResult.spokenText
-                detectedElementScreenLocation = globalLocation
-                detectedElementDisplayFrame = displayFrame
-                print("🎯 Onboarding demo: pointing at \"\(parseResult.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")
+                // Single-stop tour with the model's comment as the bubble text —
+                // it takes the place of the tag's label for the demo.
+                startPointingTour([PointingTourStop(
+                    screenLocation: Self.convertGridPointToGlobalScreenLocation(firstPoint.coordinate, on: cursorScreenCapture),
+                    displayFrame: cursorScreenCapture.displayFrame,
+                    bubbleText: parseResult.spokenText
+                )])
+                print("🎯 Onboarding demo: pointing at \"\(firstPoint.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")
             } catch {
                 print("⚠️ Onboarding demo error: \(error)")
             }
