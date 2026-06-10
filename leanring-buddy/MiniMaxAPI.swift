@@ -143,9 +143,12 @@ class MiniMaxAPI {
         ])
         messages.append(["role": "user", "content": contentBlocks])
 
+        // 4096 leaves room for the "go deep when asked" explanations the system
+        // prompt allows — a response truncated by max_tokens loses the trailing
+        // [POINT:...] tag and cuts off the spoken audio mid-sentence.
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 4096,
             "stream": true,
             "system": systemPrompt,
             "messages": messages

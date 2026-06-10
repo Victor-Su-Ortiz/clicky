@@ -565,6 +565,8 @@ final class CompanionManager: ObservableObject {
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:220,15:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:310,360:terminal:screen2]"
+
+    CRITICAL: every response must end with exactly one coordinate tag — either [POINT:x,y:label] or [POINT:none] — as the very last thing you write. exactly one tag, never more: if several elements are worth pointing at, pick the single most helpful one. the tag is stripped by software before your words are spoken aloud, so the user never hears it. never write anything after the tag, and never skip it.
     """
 
     // MARK: - AI Response Pipeline
@@ -600,17 +602,29 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
+                // The model reliably emits the [POINT:...] tag when reminded in
+                // the current turn, but tends to drop it on conversational replies
+                // when the instruction only lives in the system prompt. Conversation
+                // history stores the raw transcript, so this reminder never
+                // accumulates across turns.
+                let userPromptWithPointingReminder = transcript
+                    + "\n\n(end your response with [POINT:x,y:label] or [POINT:none])"
+
                 let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
-                    userPrompt: transcript,
+                    userPrompt: userPromptWithPointingReminder,
                     onTextChunk: { _ in
                         // No streaming text display — spinner stays until TTS plays
                     }
                 )
 
                 guard !Task.isCancelled else { return }
+
+                // Log the raw tail so missing/malformed [POINT:...] tags are
+                // visible in the console without re-instrumenting the app.
+                print("🎯 Raw response tail: …\(String(fullResponseText.suffix(160)))")
 
                 // Parse the [POINT:...] tag from the model's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
@@ -670,11 +684,19 @@ final class CompanionManager: ObservableObject {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
 
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
+                // Save this exchange to conversation history WITH its [POINT:...]
+                // tag. History entries act as in-context examples: when past
+                // replies show stripped tags, the model stops emitting them in
+                // new replies (observed: tags vanish from turn 3 onward).
+                // Responses that arrived without any tag get a synthetic
+                // [POINT:none] appended so every history entry demonstrates
+                // the required format.
+                let assistantResponseForHistory = fullResponseText.contains("[POINT:")
+                    ? fullResponseText
+                    : fullResponseText + " [POINT:none]"
                 conversationHistory.append((
                     userTranscript: transcript,
-                    assistantResponse: spokenText
+                    assistantResponse: assistantResponseForHistory
                 ))
 
                 // Keep only the last 10 exchanges to avoid unbounded context growth
@@ -768,21 +790,36 @@ final class CompanionManager: ObservableObject {
         let screenNumber: Int?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of the model's response.
-    /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
+    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the model's response.
+    /// The tag normally arrives at the very end of the response, but the model
+    /// occasionally writes it mid-sentence or adds trailing punctuation, so the
+    /// match is deliberately not anchored to the end of the text. Every tag is
+    /// stripped from the spoken text; the last tag wins if there are several.
+    /// Returns the spoken text (tags removed) and the optional coordinate + label + screen number.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
         // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
-        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#
+        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]"#
 
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
+        }
+
+        let fullTextRange = NSRange(responseText.startIndex..., in: responseText)
+        let allTagMatches = regex.matches(in: responseText, range: fullTextRange)
+        guard let match = allTagMatches.last else {
             // No tag found at all
             return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
         }
 
-        // Remove the tag from the spoken text
-        let tagRange = Range(match.range, in: responseText)!
-        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Remove every tag occurrence from the spoken text. Removing from the
+        // last match backwards keeps the earlier match ranges valid.
+        var spokenTextWithTagsRemoved = responseText
+        for tagMatch in allTagMatches.reversed() {
+            if let tagRange = Range(tagMatch.range, in: spokenTextWithTagsRemoved) {
+                spokenTextWithTagsRemoved.removeSubrange(tagRange)
+            }
+        }
+        let spokenText = spokenTextWithTagsRemoved.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Check if it's [POINT:none]
         guard match.numberOfRanges >= 3,
