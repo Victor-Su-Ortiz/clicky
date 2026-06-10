@@ -1,18 +1,21 @@
 /**
  * Clicky Proxy Worker
  *
- * Proxies requests to Claude and ElevenLabs APIs so the app never
- * ships with raw API keys. Keys are stored as Cloudflare secrets.
+ * Proxies requests to the MiniMax APIs so the app never ships with raw
+ * API keys. Keys are stored as Cloudflare secrets.
  *
  * Routes:
- *   POST /chat  → Anthropic Messages API (streaming)
- *   POST /tts   → ElevenLabs TTS API
+ *   POST /chat  → MiniMax Anthropic-compatible Messages API (streaming)
+ *   POST /tts   → MiniMax text-to-speech API (t2a_v2)
  */
 
 interface Env {
-  ANTHROPIC_API_KEY: string;
-  ELEVENLABS_API_KEY: string;
-  ELEVENLABS_VOICE_ID: string;
+  MINIMAX_API_KEY: string;
+  MINIMAX_VOICE_ID: string;
+  // Some MiniMax accounts require a GroupId query parameter on the TTS
+  // endpoint (the current docs show Bearer-only auth, but older accounts
+  // and guides still use it). Leave unset unless TTS requests fail.
+  MINIMAX_GROUP_ID?: string;
   ASSEMBLYAI_API_KEY: string;
 }
 
@@ -51,11 +54,13 @@ export default {
 async function handleChat(request: Request, env: Env): Promise<Response> {
   const body = await request.text();
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  // MiniMax's Anthropic-compatible endpoint accepts the same request body
+  // and emits the same SSE event stream as api.anthropic.com/v1/messages,
+  // so the app's existing Anthropic-format payload passes through unchanged.
+  const response = await fetch("https://api.minimax.io/anthropic/v1/messages", {
     method: "POST",
     headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
+      authorization: `Bearer ${env.MINIMAX_API_KEY}`,
       "content-type": "application/json",
     },
     body,
@@ -63,7 +68,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
 
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/chat] Anthropic API error ${response.status}: ${errorBody}`);
+    console.error(`[/chat] MiniMax API error ${response.status}: ${errorBody}`);
     return new Response(errorBody, {
       status: response.status,
       headers: { "content-type": "application/json" },
@@ -107,35 +112,84 @@ async function handleTranscribeToken(env: Env): Promise<Response> {
 }
 
 async function handleTTS(request: Request, env: Env): Promise<Response> {
-  const body = await request.text();
-  const voiceId = env.ELEVENLABS_VOICE_ID;
+  // The app sends only { "text": "..." } — the model, voice, and audio
+  // settings live here so they can change without an app update.
+  const requestBody = (await request.json()) as { text?: string };
+  const textToSpeak = requestBody.text;
 
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": env.ELEVENLABS_API_KEY,
-        "content-type": "application/json",
-        accept: "audio/mpeg",
+  if (typeof textToSpeak !== "string" || textToSpeak.length === 0) {
+    return new Response(
+      JSON.stringify({ error: "Missing 'text' in request body" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const ttsURL = env.MINIMAX_GROUP_ID
+    ? `https://api.minimax.io/v1/t2a_v2?GroupId=${env.MINIMAX_GROUP_ID}`
+    : "https://api.minimax.io/v1/t2a_v2";
+
+  const response = await fetch(ttsURL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.MINIMAX_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "speech-2.8-turbo",
+      text: textToSpeak,
+      stream: false,
+      voice_setting: {
+        voice_id: env.MINIMAX_VOICE_ID,
+        speed: 1.0,
+        vol: 1.0,
+        pitch: 0,
       },
-      body,
-    }
-  );
+      audio_setting: {
+        format: "mp3",
+        sample_rate: 32000,
+        bitrate: 128000,
+        channel: 1,
+      },
+    }),
+  });
 
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/tts] ElevenLabs API error ${response.status}: ${errorBody}`);
+    console.error(`[/tts] MiniMax TTS error ${response.status}: ${errorBody}`);
     return new Response(errorBody, {
       status: response.status,
       headers: { "content-type": "application/json" },
     });
   }
 
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "audio/mpeg",
-    },
+  // MiniMax returns the audio as a hex-encoded string inside a JSON
+  // envelope (not raw bytes), and reports request-level failures via
+  // base_resp.status_code even on HTTP 200. Decode the hex here so the
+  // app receives a complete MP3 buffer it can hand to AVAudioPlayer.
+  const result = (await response.json()) as {
+    data?: { audio?: string };
+    base_resp?: { status_code?: number; status_msg?: string };
+  };
+
+  if (result.base_resp?.status_code !== 0 || !result.data?.audio) {
+    console.error(`[/tts] MiniMax TTS synthesis failed: ${JSON.stringify(result.base_resp)}`);
+    return new Response(
+      JSON.stringify({ error: result.base_resp?.status_msg || "TTS synthesis failed" }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const audioBuffer = hexDecodeToArrayBuffer(result.data.audio);
+  return new Response(audioBuffer, {
+    status: 200,
+    headers: { "content-type": "audio/mpeg" },
   });
+}
+
+function hexDecodeToArrayBuffer(hexString: string): ArrayBuffer {
+  const bytes = new Uint8Array(hexString.length / 2);
+  for (let byteIndex = 0; byteIndex < bytes.length; byteIndex++) {
+    bytes[byteIndex] = parseInt(hexString.slice(byteIndex * 2, byteIndex * 2 + 2), 16);
+  }
+  return bytes.buffer;
 }

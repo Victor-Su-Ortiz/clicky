@@ -1,6 +1,7 @@
 name = "clicky-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
+workers_dev = true
 
 [vars]
-ELEVENLABS_VOICE_ID = "kPzsL2i3teMYv0FxEYQ6"
+MINIMAX_VOICE_ID = "English_FriendlyPerson"

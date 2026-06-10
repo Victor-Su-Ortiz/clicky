@@ -1,12 +1,16 @@
 //
-//  ClaudeAPI.swift
-//  Claude API Implementation with streaming support
+//  MiniMaxAPI.swift
+//  MiniMax LLM API implementation with streaming support
+//
+//  Talks to MiniMax's Anthropic-compatible Messages endpoint through the
+//  Cloudflare Worker proxy, so the request body and SSE event stream use
+//  the Anthropic Messages format.
 //
 
 import Foundation
 
-/// Claude API helper with streaming for progressive text display.
-class ClaudeAPI {
+/// MiniMax API helper with streaming for progressive text display.
+class MiniMaxAPI {
     private static let tlsWarmupLock = NSLock()
     private static var hasStartedTLSWarmup = false
 
@@ -14,7 +18,7 @@ class ClaudeAPI {
     var model: String
     private let session: URLSession
 
-    init(proxyURL: String, model: String = "claude-sonnet-4-6") {
+    init(proxyURL: String, model: String = "MiniMax-M3") {
         self.apiURL = URL(string: proxyURL)!
         self.model = model
 
@@ -78,7 +82,7 @@ class ClaudeAPI {
         }
 
         // The TLS session ticket is host-scoped, so warming the root host is enough.
-        // Hitting the host instead of `/v1/messages` avoids extra endpoint-specific noise.
+        // Hitting the host instead of the chat endpoint avoids extra endpoint-specific noise.
         warmupURLComponents.path = "/"
         warmupURLComponents.query = nil
         warmupURLComponents.fragment = nil
@@ -95,7 +99,7 @@ class ClaudeAPI {
         }.resume()
     }
 
-    /// Send a vision request to Claude with streaming.
+    /// Send a vision request to MiniMax with streaming.
     /// Calls `onTextChunk` on the main actor each time new text arrives so the UI updates progressively.
     /// Returns the full accumulated text and total duration when the stream completes.
     func analyzeImageStreaming(
@@ -150,14 +154,14 @@ class ClaudeAPI {
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
         let payloadMB = Double(bodyData.count) / 1_048_576.0
-        print("🌐 Claude streaming request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
+        print("🌐 MiniMax streaming request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
         // Use bytes streaming for SSE (Server-Sent Events)
         let (byteStream, response) = try await session.bytes(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NSError(
-                domain: "ClaudeAPI",
+                domain: "MiniMaxAPI",
                 code: -1,
                 userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"]
             )
@@ -171,7 +175,7 @@ class ClaudeAPI {
             }
             let errorBody = errorBodyChunks.joined(separator: "\n")
             throw NSError(
-                domain: "ClaudeAPI",
+                domain: "MiniMaxAPI",
                 code: httpResponse.statusCode,
                 userInfo: [NSLocalizedDescriptionKey: "API Error (\(httpResponse.statusCode)): \(errorBody)"]
             )
@@ -260,7 +264,7 @@ class ClaudeAPI {
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
         let payloadMB = Double(bodyData.count) / 1_048_576.0
-        print("🌐 Claude request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
+        print("🌐 MiniMax request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
         let (data, response) = try await session.data(for: request)
 
@@ -268,7 +272,7 @@ class ClaudeAPI {
               (200...299).contains(httpResponse.statusCode) else {
             let responseString = String(data: data, encoding: .utf8) ?? "Unknown error"
             throw NSError(
-                domain: "ClaudeAPI",
+                domain: "MiniMaxAPI",
                 code: (response as? HTTPURLResponse)?.statusCode ?? -1,
                 userInfo: [NSLocalizedDescriptionKey: "API Error: \(responseString)"]
             )
@@ -279,7 +283,7 @@ class ClaudeAPI {
               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
               let text = textBlock["text"] as? String else {
             throw NSError(
-                domain: "ClaudeAPI",
+                domain: "MiniMaxAPI",
                 code: -1,
                 userInfo: [NSLocalizedDescriptionKey: "Invalid response format"]
             )

@@ -32,7 +32,7 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasScreenContentPermission = false
 
     /// Screen location (global AppKit coords) of a detected UI element the
-    /// buddy should fly to and point at. Parsed from Claude's response;
+    /// buddy should fly to and point at. Parsed from the model's response;
     /// observed by BlueCursorView to trigger the flight animation.
     @Published var detectedElementScreenLocation: CGPoint?
     /// The display frame (global AppKit coords) of the screen the detected
@@ -70,18 +70,18 @@ final class CompanionManager: ObservableObject {
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    private static let workerBaseURL = "https://clicky-proxy.minimax-together.workers.dev"
 
-    private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+    private lazy var miniMaxAPI: MiniMaxAPI = {
+        return MiniMaxAPI(proxyURL: "\(Self.workerBaseURL)/chat")
     }()
 
-    private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+    private lazy var miniMaxTTSClient: MiniMaxTTSClient = {
+        return MiniMaxTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
 
-    /// Conversation history so Claude remembers prior exchanges within a session.
-    /// Each entry is the user's transcript and Claude's response.
+    /// Conversation history so the model remembers prior exchanges within a session.
+    /// Each entry is the user's transcript and the model's response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
 
     /// The currently running AI response task, if any. Cancelled when the user
@@ -106,15 +106,6 @@ final class CompanionManager: ObservableObject {
     /// Whether the blue cursor overlay is currently visible on screen.
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
-
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
-
-    func setSelectedModel(_ model: String) {
-        selectedModel = model
-        UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
-    }
 
     /// User preference for whether the Clicky cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
@@ -179,9 +170,9 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        // Eagerly touch the Claude API so its TLS warmup handshake completes
+        // Eagerly touch the MiniMax API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
-        _ = claudeAPI
+        _ = miniMaxAPI
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -493,7 +484,7 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
-            elevenLabsTTSClient.stopPlayback()
+            miniMaxTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -521,7 +512,7 @@ final class CompanionManager: ObservableObject {
                         self?.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        self?.sendTranscriptToMiniMaxWithScreenshot(transcript: finalTranscript)
                     }
                 )
             }
@@ -563,29 +554,29 @@ final class CompanionManager: ObservableObject {
 
     don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
 
-    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
+    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. coordinates use a 0 to 1000 grid laid over the screenshot: (0,0) is the top-left corner of the image and (1000,1000) is the bottom-right corner. x increases rightward, y increases downward. so the center of the screen is 500,500 and something near the top-right corner is around 950,50.
 
-    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
+    format: [POINT:x,y:label] where x,y are integers from 0 to 1000 on that grid, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
     if pointing wouldn't help, append [POINT:none].
 
     examples:
-    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
+    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:880,40:color inspector]"
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
-    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
-    - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
+    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:220,15:source control]"
+    - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:310,360:terminal:screen2]"
     """
 
     // MARK: - AI Response Pipeline
 
-    /// Captures a screenshot, sends it along with the transcript to Claude,
-    /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
+    /// Captures a screenshot, sends it along with the transcript to MiniMax,
+    /// and plays the response aloud via MiniMax TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
-    /// Claude's response may include a [POINT:x,y:label] tag which triggers
+    /// The model's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    private func sendTranscriptToMiniMaxWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        miniMaxTTSClient.stopPlayback()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -597,20 +588,19 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Build image labels with the actual screenshot pixel dimensions
-                // so Claude's coordinate space matches the image it sees. We
-                // scale from screenshot pixels to display points ourselves.
+                // Screenshot labels identify each screen. The model reports
+                // pointing coordinates on a 0–1000 grid laid over the image,
+                // so the labels don't need pixel dimensions.
                 let labeledImages = screenCaptures.map { capture in
-                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
-                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                    (data: capture.imageData, label: capture.label)
                 }
 
-                // Pass conversation history so Claude remembers prior exchanges
+                // Pass conversation history so the model remembers prior exchanges
                 let historyForAPI = conversationHistory.map { entry in
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
@@ -622,11 +612,11 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
+                // Parse the [POINT:...] tag from the model's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
+                // Handle element pointing if the model returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
                 // becomes visible and can fly to the target. Without this, the
                 // spinner hides the triangle and the flight animation is invisible.
@@ -635,7 +625,7 @@ final class CompanionManager: ObservableObject {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Claude's screen number,
+                // Pick the screen capture matching the model's screen number,
                 // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
                     if let screenNumber = parseResult.screenNumber,
@@ -647,24 +637,23 @@ final class CompanionManager: ObservableObject {
 
                 if let pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
+                    // The model's coordinates are on a 0–1000 grid laid over
+                    // the screenshot (top-left origin). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
+                    let coordinateGridMax: CGFloat = 1000
                     let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
                     let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
                     let displayFrame = targetScreenCapture.displayFrame
 
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
+                    // Clamp to the 0–1000 coordinate grid
+                    let clampedX = max(0, min(pointCoordinate.x, coordinateGridMax))
+                    let clampedY = max(0, min(pointCoordinate.y, coordinateGridMax))
 
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+                    // Scale from the 0–1000 grid to display points
+                    let displayLocalX = clampedX * (displayWidth / coordinateGridMax)
+                    let displayLocalY = clampedY * (displayHeight / coordinateGridMax)
 
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
+                    // Convert from top-left origin (grid) to bottom-left origin (AppKit)
                     let appKitY = displayHeight - displayLocalY
 
                     // Convert display-local coords to global screen coords
@@ -701,12 +690,12 @@ final class CompanionManager: ObservableObject {
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
+                        try await miniMaxTTSClient.speakText(spokenText)
                         // speakText returns after player.play() — audio is now playing
                         voiceState = .responding
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
+                        print("⚠️ MiniMax TTS error: \(error)")
                         speakCreditsErrorFallback()
                     }
                 }
@@ -735,7 +724,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while miniMaxTTSClient.isPlaying {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -757,7 +746,7 @@ final class CompanionManager: ObservableObject {
 
     /// Speaks a hardcoded error message using macOS system TTS when API
     /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
+    /// MiniMax TTS is down.
     private func speakCreditsErrorFallback() {
         let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
         let synthesizer = NSSpeechSynthesizer()
@@ -767,11 +756,11 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Point Tag Parsing
 
-    /// Result of parsing a [POINT:...] tag from Claude's response.
+    /// Result of parsing a [POINT:...] tag from the model's response.
     struct PointingParseResult {
         /// The response text with the [POINT:...] tag removed — this is what gets spoken.
         let spokenText: String
-        /// The parsed pixel coordinate, or nil if Claude said "none" or no tag was found.
+        /// The parsed 0–1000 grid coordinate, or nil if the model said "none" or no tag was found.
         let coordinate: CGPoint?
         /// Short label describing the element (e.g. "run button"), or "none".
         let elementLabel: String?
@@ -779,7 +768,7 @@ final class CompanionManager: ObservableObject {
         let screenNumber: Int?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
+    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of the model's response.
     /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
         // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
@@ -952,16 +941,16 @@ final class CompanionManager: ObservableObject {
 
     make a short quirky 3-6 word observation about the specific thing you picked — something fun, playful, or curious that shows you actually read/recognized it. no emojis ever. NEVER quote or repeat text you see on screen — just react to it. keep it to 6 words max, no exceptions.
 
-    CRITICAL COORDINATE RULE: you MUST only pick elements near the CENTER of the screen. your x coordinate must be between 20%-80% of the image width. your y coordinate must be between 20%-80% of the image height. do NOT pick anything in the top 20%, bottom 20%, left 20%, or right 20% of the screen. no menu bar items, no dock icons, no sidebar items, no items near any edge. only things clearly in the middle area of the screen. if the only interesting things are near the edges, pick something boring in the center instead.
+    CRITICAL COORDINATE RULE: you MUST only pick elements near the CENTER of the screen. coordinates use a 0 to 1000 grid laid over the image, so your x coordinate must be between 200 and 800, and your y coordinate must be between 200 and 800. do NOT pick anything in the top 20%, bottom 20%, left 20%, or right 20% of the screen. no menu bar items, no dock icons, no sidebar items, no items near any edge. only things clearly in the middle area of the screen. if the only interesting things are near the edges, pick something boring in the center instead.
 
     respond with ONLY your short comment followed by the coordinate tag. nothing else. all lowercase.
 
     format: your comment [POINT:x,y:label]
 
-    the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. origin (0,0) is top-left. x increases rightward, y increases downward.
+    coordinates are on a 0 to 1000 grid laid over the screenshot: (0,0) is the top-left corner of the image, (1000,1000) is the bottom-right corner. x increases rightward, y increases downward.
     """
 
-    /// Captures a screenshot and asks Claude to find something interesting to
+    /// Captures a screenshot and asks MiniMax to find something interesting to
     /// point at, then triggers the buddy's flight animation. Used during
     /// onboarding to demo the pointing feature while the intro video plays.
     func performOnboardingDemoInteraction() {
@@ -972,17 +961,16 @@ final class CompanionManager: ObservableObject {
             do {
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
 
-                // Only send the cursor screen so Claude can't pick something
+                // Only send the cursor screen so the model can't pick something
                 // on a different monitor that we can't point at.
                 guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
                     print("🎯 Onboarding demo: no cursor screen found")
                     return
                 }
 
-                let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
-                let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
+                let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label)]
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
                     userPrompt: "look around my screen and find something interesting to point at",
@@ -996,23 +984,23 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                let screenshotWidth = CGFloat(cursorScreenCapture.screenshotWidthInPixels)
-                let screenshotHeight = CGFloat(cursorScreenCapture.screenshotHeightInPixels)
+                // The model's coordinates are on a 0–1000 grid laid over the screenshot
+                let coordinateGridMax: CGFloat = 1000
                 let displayWidth = CGFloat(cursorScreenCapture.displayWidthInPoints)
                 let displayHeight = CGFloat(cursorScreenCapture.displayHeightInPoints)
                 let displayFrame = cursorScreenCapture.displayFrame
 
-                let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-                let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+                let clampedX = max(0, min(pointCoordinate.x, coordinateGridMax))
+                let clampedY = max(0, min(pointCoordinate.y, coordinateGridMax))
+                let displayLocalX = clampedX * (displayWidth / coordinateGridMax)
+                let displayLocalY = clampedY * (displayHeight / coordinateGridMax)
                 let appKitY = displayHeight - displayLocalY
                 let globalLocation = CGPoint(
                     x: displayLocalX + displayFrame.origin.x,
                     y: appKitY + displayFrame.origin.y
                 )
 
-                // Set custom bubble text so the pointing animation uses Claude's
+                // Set custom bubble text so the pointing animation uses the model's
                 // comment instead of a random phrase
                 detectedElementBubbleText = parseResult.spokenText
                 detectedElementScreenLocation = globalLocation
