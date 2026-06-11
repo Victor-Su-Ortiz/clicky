@@ -94,8 +94,9 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
+    /// Cursor-adjacent panel that displays the coding-agent improvement prompt
+    /// with a "copied to clipboard" confirmation footer.
+    private let improvementPromptOverlayManager = CompanionResponseOverlayManager()
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
@@ -159,6 +160,7 @@ final class CompanionManager: ObservableObject {
             // location, which would leave an invisible buddy on re-enable.
             cancelPointingTour()
             overlayWindowManager.hideOverlay()
+            improvementPromptOverlayManager.hideOverlay()
             isOverlayVisible = false
         }
     }
@@ -369,6 +371,7 @@ final class CompanionManager: ObservableObject {
         buddyDictationManager.cancelCurrentDictation()
         cancelPointingTour()
         overlayWindowManager.hideOverlay()
+        improvementPromptOverlayManager.hideOverlay()
         transientHideTask?.cancel()
 
         currentResponseTask?.cancel()
@@ -574,6 +577,8 @@ final class CompanionManager: ObservableObject {
             currentResponseTask?.cancel()
             miniMaxTTSClient.stopPlayback()
             cancelPointingTour()
+            // The previous turn's improvement prompt is stale once the user speaks again
+            improvementPromptOverlayManager.hideOverlay()
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -621,43 +626,83 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're clicky, a very experienced web designer who lives in the user's menu bar. you've done thousands of design reviews and you can glance at a webpage and immediately see what's hurting it — weak visual hierarchy, cramped or uneven spacing, sloppy typography, muddy color and contrast, vague copy, broken layout. the user just spoke to you via push-to-talk and you can see their screen(s), usually a webpage they're building. your spoken reply goes through text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember every critique and every improvement prompt you've already given them.
 
-    rules:
-    - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
-    - all lowercase, casual, warm. no emojis.
+    every response has up to three parts, always in this exact order:
+    1. a short spoken critique — always present.
+    2. a detailed improvement prompt wrapped in [PROMPT] and [/PROMPT] — only when the page has real problems to fix.
+    3. pointing tags — always present, always the very last thing.
+
+    spoken critique rules:
+    - two to four short sentences. lead with the biggest problem, then the next most important ones. be direct but warm — a senior designer who wants the work to win, not a critic showing off.
+    - all lowercase, casual. no emojis.
     - write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
-    - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
-    - if the user's question relates to what's on their screen, reference specific things you see.
-    - if the screenshot doesn't seem relevant to their question, just answer the question directly.
-    - you can help with anything — coding, writing, general knowledge, brainstorming.
+    - no abbreviations or symbols that sound weird read aloud. say "for example" not "e.g.". keep exact pixel values and hex codes out of your voice — those belong in the improvement prompt.
+    - name the actual things you see — "the hero headline", "those three pricing cards", "the nav links" — so the user knows exactly what you mean.
     - never say "simply" or "just".
-    - don't read out code verbatim. describe what the code does or what needs to change conversationally.
-    - focus on giving a thorough, useful explanation. don't end with simple yes/no questions like "want me to explain more?" or "should i show you?" — those are dead ends that force the user to just say yes.
-    - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
-    - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+    - keep the spoken part short even when a lot is wrong. the deep detail goes in the improvement prompt, not your voice. if the user explicitly asks you to explain something in depth, you can talk longer — but implementation specifics still go in the prompt block.
+    - when you include a [PROMPT] block, end your spoken critique by telling the user the full prompt is on their clipboard, ready to paste into their coding agent.
+    - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — review that one unless the user says otherwise.
+    - if the screen isn't a webpage, say what you see and ask them to bring the page up. don't review a code editor or a terminal as if it were a design.
 
-    element pointing:
-    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
+    pointing at problem areas:
+    you have a small blue triangle cursor that can fly to and point at spots on screen. when you critique a page, point at the actual problem areas so the user sees exactly what you mean. point at up to FOUR spots, in the same order you mention them in your critique — worst problem first. each label is a short 1-3 word name of the problem, like "weak headline" or "cramped nav" or "low contrast".
 
-    don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
+    coordinates use a 0 to 1000 grid laid over the screenshot: (0,0) is the top-left corner of the image and (1000,1000) is the bottom-right corner. x increases rightward, y increases downward. so the center of the screen is 500,500 and something near the top-right corner is around 950,50.
 
-    when you point, append coordinate tags at the very end of your response, AFTER your spoken text. coordinates use a 0 to 1000 grid laid over the screenshot: (0,0) is the top-left corner of the image and (1000,1000) is the bottom-right corner. x increases rightward, y increases downward. so the center of the screen is 500,500 and something near the top-right corner is around 950,50.
+    format: [POINT:x,y:label] where x,y are integers from 0 to 1000 on that grid. if the spot is on the cursor's screen you can omit the screen number. if it's on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2) — without it the cursor points at the wrong place.
 
-    format: [POINT:x,y:label] where x,y are integers from 0 to 1000 on that grid, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
+    write multiple tags back to back, like [POINT:500,180:weak headline][POINT:820,40:cramped nav]. the cursor visits them in order and shows each label in a little speech bubble. if pointing wouldn't help — a general question, no page on screen, or the page is good and there's nothing to flag — append [POINT:none].
 
-    you can point at up to FOUR elements in one response by writing multiple tags back to back, like [POINT:120,80:file menu][POINT:430,200:share button]. the cursor visits them in the order you write them and shows each label in a little speech bubble, so order them the way the user should look at them — first step first. most answers only need one tag. only use several when the user genuinely needs a sequence of places, like the steps of a workflow or a few related controls.
+    the improvement prompt ([PROMPT] block):
+    when the page has real problems, write a detailed improvement prompt the user will paste into a coding agent like claude code or cursor. wrap it in [PROMPT] and [/PROMPT]. this block is never spoken aloud — software strips it, shows it on screen, and copies it to the user's clipboard automatically — so write it as a finished artifact, not as dialogue.
 
-    if pointing wouldn't help, append [POINT:none].
+    inside the block:
+    - write TO the coding agent in second-person imperative: "increase the hero headline to...", "darken the nav links to...". no greeting, no "here's a prompt", no sign-off.
+    - be specific and actionable. name concrete elements and sections ("the three pricing cards under the 'plans' heading"), give concrete values (font sizes, weights, spacing, hex colors) where you can, and add one short clause of design reasoning per fix so the agent makes good judgment calls ("so the headline clearly dominates the subhead").
+    - cover whatever actually matters on this page — visual hierarchy, spacing and alignment, typography, color and contrast, copy, layout — and skip categories that are fine. never pad the list.
+    - number the fixes and order them by impact, biggest first.
+    - markdown inside the block is fine (a coding agent reads it), but no fluff — every line should be a change. aim for roughly 150 to 300 words.
+    - never write [POINT: tags or the markers [PROMPT] or [/PROMPT] inside the block, and always close the block with [/PROMPT].
+
+    skip the [PROMPT] block entirely when:
+    - the user asks a general question that isn't a page review — answer it in speech.
+    - the page is genuinely in good shape — say so and don't invent problems.
+    - there's no webpage on screen.
+
+    re-reviews ("is it good now?"):
+    when the user comes back after applying your prompt, you get a fresh screenshot. compare it against what you asked for — your earlier [PROMPT] blocks are in this conversation. first acknowledge specifically what improved. then call out anything still off or newly broken. if real issues remain, include a fresh [PROMPT] block covering ONLY the remaining and new issues — never repeat fixes that already landed. if the page is genuinely good now, say so plainly and skip the block. don't manufacture nitpicks to seem useful.
 
     examples:
-    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:880,40:color inspector]"
-    - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
-    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:220,15:source control]"
-    - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:310,360:terminal:screen2]"
-    - user asks how to export a video in final cut: "head up to the file menu, then share, then export file in that submenu — i'll walk you through it. [POINT:60,15:file menu][POINT:140,200:share][POINT:300,260:export file]"
 
-    CRITICAL: every response must end with coordinate tags — one to four [POINT:x,y:label] tags back to back, or a single [POINT:none] — as the very last thing you write. never more than four tags, and never mix [POINT:none] with coordinate tags. the tags are stripped by software before your words are spoken aloud, so the user never hears them. never write anything after the tags, and never skip them.
+    user asks "what's wrong with this page?" with their landing page on screen:
+    "the bones are good, but your hero is fighting itself — the headline and the screenshot have the same visual weight so nothing leads. section spacing is uneven too, and those gray nav links are hard to read. i put a full prompt on your clipboard — paste it into your coding agent.
+    [PROMPT]
+    improve this landing page. fixes ordered by impact:
+
+    1. **hero hierarchy.** increase the hero headline to 56-64px weight 700 and drop the subhead to 18px regular in a secondary text color, so the headline clearly dominates. add 24-32px of vertical space between headline, subhead, and the cta button.
+    2. **section rhythm.** normalize vertical padding between all sections to one consistent scale (96px desktop, 64px mobile). the gap above the features section is currently about double the gap above pricing.
+    3. **nav contrast.** the nav links are light gray on white. darken them to at least #374151 and give the active link a visibly distinct state.
+    4. **cta copy.** the primary button says "submit", which says nothing. change it to a verb-plus-value label like "start free trial".
+    [/PROMPT]
+    [POINT:500,200:weak hero hierarchy][POINT:500,640:uneven spacing][POINT:850,40:low contrast nav][POINT:500,330:vague cta]"
+
+    user asks "is it good now?" after applying your fixes, hero fixed but spacing still off:
+    "the hero is way better — that headline finally leads the page. spacing is still uneven though, the gap above pricing is about half the others. one small prompt on your clipboard.
+    [PROMPT]
+    one remaining fix on this landing page:
+
+    1. **section rhythm.** normalize vertical padding between all sections to one consistent value (96px desktop, 64px mobile). the gap above the pricing section is still roughly half the gap above features.
+    [/PROMPT]
+    [POINT:500,660:uneven spacing]"
+
+    user asks "is it good now?" and the page genuinely looks good:
+    "yeah, this is solid now. the hierarchy reads top to bottom the way it should, spacing is consistent, and the cta finally pops. ship it. [POINT:none]"
+
+    user asks a general question like "what font pairs well with inter?":
+    "inter is a workhorse, so pair it with something that has more personality for headlines — newsreader or fraunces gives you that editorial contrast without clashing. [POINT:none]"
+
+    CRITICAL: every response must end with coordinate tags — one to four [POINT:x,y:label] tags back to back, or a single [POINT:none] — as the very last thing you write, AFTER the [/PROMPT] marker if you wrote a prompt block. the order is always: spoken critique, then the optional [PROMPT]...[/PROMPT] block, then the tags. if you open a [PROMPT] block you MUST close it with [/PROMPT] before the tags. never more than four tags, never mix [POINT:none] with coordinate tags, never write anything after the tags, and never skip them. the prompt block and the tags are stripped by software before your words are spoken aloud, so the user never hears them.
     """
 
     // MARK: - AI Response Pipeline
@@ -665,11 +710,15 @@ final class CompanionManager: ObservableObject {
     /// Captures a screenshot, sends it along with the transcript to MiniMax,
     /// and plays the response aloud via MiniMax TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
-    /// The model's response may include up to four [POINT:x,y:label] tags
-    /// which start a pointing tour — the buddy visits each element in order.
+    /// The model's response may include an optional [PROMPT]...[/PROMPT]
+    /// improvement prompt — auto-copied to the clipboard and displayed next
+    /// to the cursor — and up to four [POINT:x,y:label] tags which start a
+    /// pointing tour of the problem areas.
     private func sendTranscriptToMiniMaxWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         miniMaxTTSClient.stopPlayback()
+        // The previous turn's improvement prompt is stale once a new turn begins
+        improvementPromptOverlayManager.hideOverlay()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -693,19 +742,20 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                // The model reliably emits the [POINT:...] tag when reminded in
-                // the current turn, but tends to drop it on conversational replies
-                // when the instruction only lives in the system prompt. Conversation
-                // history stores the raw transcript, so this reminder never
-                // accumulates across turns.
-                let userPromptWithPointingReminder = transcript
-                    + "\n\n(end your response with one to four [POINT:x,y:label] tags or a single [POINT:none])"
+                // The model reliably follows the response format when reminded
+                // in the current turn, but tends to drop format scaffolding
+                // (the [PROMPT] block and [POINT:...] tags) when the instruction
+                // only lives in the system prompt. Conversation history stores
+                // the raw transcript, so this reminder never accumulates across
+                // turns.
+                let userPromptWithFormatReminder = transcript
+                    + "\n\n(format reminder: short spoken critique first; if the page needs work, include the full improvement prompt wrapped in [PROMPT]...[/PROMPT]; then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
 
                 let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
-                    userPrompt: userPromptWithPointingReminder,
+                    userPrompt: userPromptWithFormatReminder,
                     onTextChunk: { _ in
                         // No streaming text display — spinner stays until TTS plays
                     }
@@ -717,9 +767,21 @@ final class CompanionManager: ObservableObject {
                 // visible in the console without re-instrumenting the app.
                 print("🎯 Raw response tail: …\(String(fullResponseText.suffix(160)))")
 
-                // Parse the [POINT:...] tag from the model's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
+                // Split the response into spoken critique, optional improvement
+                // prompt, and [POINT:...] tags. The prompt block is extracted
+                // before point parsing so its content can never trigger pointing.
+                let parseResult = Self.parseCompanionResponse(from: fullResponseText)
                 let spokenText = parseResult.spokenText
+
+                // Auto-copy the coding-agent prompt and show it next to the
+                // cursor with the "copied to clipboard" confirmation. This runs
+                // before TTS so the confirmation is on screen while the critique
+                // is spoken and the cursor tours the problem areas.
+                if let improvementPromptText = parseResult.improvementPromptText {
+                    copyImprovementPromptToClipboard(improvementPromptText)
+                    improvementPromptOverlayManager.showImprovementPrompt(improvementPromptText)
+                    ClickyAnalytics.trackImprovementPromptGenerated(improvementPrompt: improvementPromptText)
+                }
 
                 // Resolve each parsed point to a tour stop with global AppKit
                 // coordinates. Per-point screen selection: an explicit :screenN
@@ -763,13 +825,16 @@ final class CompanionManager: ObservableObject {
                     print("🎯 Element pointing: no elements")
                 }
 
-                // Save this exchange to conversation history WITH its [POINT:...]
-                // tag. History entries act as in-context examples: when past
-                // replies show stripped tags, the model stops emitting them in
-                // new replies (observed: tags vanish from turn 3 onward).
-                // Responses that arrived without any tag get a synthetic
-                // [POINT:none] appended so every history entry demonstrates
-                // the required format.
+                // Save this exchange to conversation history WITH its [PROMPT]
+                // block and [POINT:...] tags. History entries act as in-context
+                // examples: when past replies show stripped tags, the model
+                // stops emitting them in new replies (observed: tags vanish
+                // from turn 3 onward). Keeping the raw block also lets
+                // re-review turns compare the page against what was previously
+                // asked for. Responses that arrived without any tag get a
+                // synthetic [POINT:none] appended so every history entry
+                // demonstrates the required format; no such backfill for the
+                // prompt block because it is optional by design.
                 let assistantResponseForHistory = fullResponseText.contains("[POINT:")
                     ? fullResponseText
                     : fullResponseText + " [POINT:none]"
@@ -853,6 +918,15 @@ final class CompanionManager: ObservableObject {
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    /// Copies the improvement prompt to the system clipboard so the user can
+    /// paste it straight into their coding agent. clearContents() is required
+    /// before setString — NSPasteboard ignores writes to a stale change count.
+    private func copyImprovementPromptToClipboard(_ improvementPromptText: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(improvementPromptText, forType: .string)
     }
 
     // MARK: - Point Tag Parsing
@@ -944,6 +1018,80 @@ final class CompanionManager: ObservableObject {
         return PointingParseResult(
             spokenText: spokenText,
             points: Array(points.prefix(maximumPointingTourStops))
+        )
+    }
+
+    // MARK: - Companion Response Parsing
+
+    /// Result of splitting the model's response into its three parts: spoken
+    /// critique, optional coding-agent improvement prompt, and pointing tags.
+    struct CompanionResponseParseResult {
+        /// The critique with the [PROMPT] block and every [POINT:...] tag
+        /// removed — this is what gets spoken via TTS.
+        let spokenText: String
+        /// The improvement prompt body (without the [PROMPT]/[/PROMPT]
+        /// markers), or nil when the model omitted the block — for example a
+        /// re-review turn where the page is good, or a general question.
+        let improvementPromptText: String?
+        /// Pointing tour stops, same semantics as PointingParseResult.points.
+        let points: [ParsedPointTag]
+    }
+
+    private static let improvementPromptOpeningMarker = "[PROMPT]"
+    private static let improvementPromptClosingMarker = "[/PROMPT]"
+
+    /// Splits the model's raw response into the spoken critique, the optional
+    /// [PROMPT]...[/PROMPT] improvement prompt, and the [POINT:...] tags.
+    /// The prompt block is extracted FIRST so coordinate-like text inside it
+    /// can never trigger a pointing tour; the existing point-tag parser then
+    /// runs on the remainder. parsePointingCoordinates itself is untouched
+    /// because the onboarding demo also calls it.
+    static func parseCompanionResponse(from responseText: String) -> CompanionResponseParseResult {
+        var remainingResponseText = responseText
+        var improvementPromptText: String? = nil
+
+        if let openingMarkerRange = remainingResponseText.range(of: improvementPromptOpeningMarker) {
+            let textAfterOpeningMarker = remainingResponseText[openingMarkerRange.upperBound...]
+
+            if let closingMarkerRange = textAfterOpeningMarker.range(of: improvementPromptClosingMarker) {
+                // Well-formed block: the prompt is the text between the markers.
+                improvementPromptText = String(textAfterOpeningMarker[..<closingMarkerRange.lowerBound])
+                remainingResponseText = String(remainingResponseText[..<openingMarkerRange.lowerBound])
+                    + String(textAfterOpeningMarker[closingMarkerRange.upperBound...])
+            } else if let firstPointTagRange = textAfterOpeningMarker.range(of: "[POINT:") {
+                // Unterminated block (the model forgot [/PROMPT] or generation
+                // was truncated): the prompt ends where the tags begin, so the
+                // tags still drive the pointing tour and the block's contents
+                // can never leak into the spoken text.
+                improvementPromptText = String(textAfterOpeningMarker[..<firstPointTagRange.lowerBound])
+                remainingResponseText = String(remainingResponseText[..<openingMarkerRange.lowerBound])
+                    + String(textAfterOpeningMarker[firstPointTagRange.lowerBound...])
+            } else {
+                // Unterminated block with no tags at all: everything after the
+                // opening marker is the prompt.
+                improvementPromptText = String(textAfterOpeningMarker)
+                remainingResponseText = String(remainingResponseText[..<openingMarkerRange.lowerBound])
+            }
+        }
+
+        // Strip any stray markers so TTS never reads bracket junk, and treat
+        // an empty or whitespace-only block as absent (no clipboard write,
+        // no overlay).
+        remainingResponseText = remainingResponseText
+            .replacingOccurrences(of: improvementPromptOpeningMarker, with: "")
+            .replacingOccurrences(of: improvementPromptClosingMarker, with: "")
+        let trimmedImprovementPromptText = improvementPromptText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let pointingParseResult = parsePointingCoordinates(from: remainingResponseText)
+
+        return CompanionResponseParseResult(
+            // Trim again here: removing the prompt block can leave whitespace
+            // behind, and parsePointingCoordinates returns its input untrimmed
+            // when the response contains no tags.
+            spokenText: pointingParseResult.spokenText.trimmingCharacters(in: .whitespacesAndNewlines),
+            improvementPromptText: (trimmedImprovementPromptText?.isEmpty == false) ? trimmedImprovementPromptText : nil,
+            points: pointingParseResult.points
         )
     }
 

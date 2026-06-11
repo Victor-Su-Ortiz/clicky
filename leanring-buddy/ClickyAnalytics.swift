@@ -95,6 +95,15 @@ enum ClickyAnalytics {
         ])
     }
 
+    /// The model produced a detailed improvement prompt that was auto-copied
+    /// to the clipboard and displayed next to the cursor.
+    static func trackImprovementPromptGenerated(improvementPrompt: String) {
+        PostHogSDK.shared.capture("improvement_prompt_generated", properties: [
+            "improvement_prompt": improvementPrompt,
+            "character_count": improvementPrompt.count
+        ])
+    }
+
     /// The model's response included a [POINT:x,y:label] coordinate tag,
     /// so the buddy is flying to point at a UI element.
     static func trackElementPointed(elementLabel: String?) {
