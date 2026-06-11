@@ -5,3 +5,9 @@ workers_dev = true
 
 [vars]
 MINIMAX_VOICE_ID = "English_FriendlyPerson"
+# Which upstream serves /chat: "minimax" (default) or "together".
+# Together is text-only until they list MiniMax M3 (M2.7 has no vision) —
+# flip to "together" and update TOGETHER_CHAT_MODEL once M3 is live, then
+# `npx wrangler deploy`. Requires the TOGETHER_API_KEY secret.
+CHAT_UPSTREAM = "minimax"
+TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7"

@@ -5,7 +5,11 @@
  * API keys. Keys are stored as Cloudflare secrets.
  *
  * Routes:
- *   POST /chat  → MiniMax Anthropic-compatible Messages API (streaming)
+ *   POST /chat  → MiniMax Anthropic-compatible Messages API (streaming),
+ *                 or Together AI's OpenAI-compatible API when
+ *                 CHAT_UPSTREAM = "together" (the Worker translates the
+ *                 request body and SSE stream both ways, so the app always
+ *                 speaks Anthropic Messages format regardless of upstream)
  *   POST /tts   → MiniMax text-to-speech API (t2a_v2)
  */
 
@@ -17,7 +21,18 @@ interface Env {
   // and guides still use it). Leave unset unless TTS requests fail.
   MINIMAX_GROUP_ID?: string;
   ASSEMBLYAI_API_KEY: string;
+  // Which upstream serves /chat: "minimax" (default) or "together".
+  // Together is text-only until they ship MiniMax M3 (M2.7 has no vision),
+  // so flip this only for plumbing tests or once TOGETHER_CHAT_MODEL points
+  // at a vision-capable model.
+  CHAT_UPSTREAM?: string;
+  TOGETHER_API_KEY?: string;
+  // Together serverless model id, e.g. "MiniMaxAI/MiniMax-M2.7". Change to
+  // the M3 id once Together lists it.
+  TOGETHER_CHAT_MODEL?: string;
 }
+
+const DEFAULT_TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -54,6 +69,10 @@ export default {
 async function handleChat(request: Request, env: Env): Promise<Response> {
   const body = await request.text();
 
+  if (env.CHAT_UPSTREAM === "together") {
+    return handleChatViaTogether(body, env);
+  }
+
   // MiniMax's Anthropic-compatible endpoint accepts the same request body
   // and emits the same SSE event stream as api.anthropic.com/v1/messages,
   // so the app's existing Anthropic-format payload passes through unchanged.
@@ -80,6 +99,396 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     headers: {
       "content-type": response.headers.get("content-type") || "text/event-stream",
       "cache-control": "no-cache",
+    },
+  });
+}
+
+/**
+ * Serves /chat through Together AI's OpenAI-compatible endpoint while the
+ * app keeps speaking Anthropic Messages format: the request body is
+ * translated Anthropic → OpenAI on the way out, and the response (JSON or
+ * SSE stream) is translated back OpenAI → Anthropic on the way in.
+ */
+async function handleChatViaTogether(anthropicBodyText: string, env: Env): Promise<Response> {
+  if (!env.TOGETHER_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "CHAT_UPSTREAM is 'together' but the TOGETHER_API_KEY secret is not set" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let anthropicRequest: AnthropicChatRequest;
+  try {
+    anthropicRequest = JSON.parse(anthropicBodyText) as AnthropicChatRequest;
+  } catch (error) {
+    return new Response(
+      JSON.stringify({ error: `Invalid JSON request body: ${String(error)}` }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const togetherModelId = env.TOGETHER_CHAT_MODEL || DEFAULT_TOGETHER_CHAT_MODEL;
+  const openAIRequest = anthropicToOpenAIChatRequest(anthropicRequest, togetherModelId);
+
+  const response = await fetch("https://api.together.xyz/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.TOGETHER_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(openAIRequest),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/chat] Together API error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (openAIRequest.stream) {
+    const translatedStream = response.body!.pipeThrough(createOpenAIToAnthropicSSETransform());
+    return new Response(translatedStream, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      },
+    });
+  }
+
+  const openAIResponse = (await response.json()) as OpenAIChatResponse;
+  return new Response(JSON.stringify(openAIToAnthropicResponse(openAIResponse)), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// MARK: Anthropic ⇄ OpenAI translation
+
+interface AnthropicContentBlock {
+  type: string;
+  text?: string;
+  source?: { type: string; media_type: string; data: string };
+}
+
+interface AnthropicChatRequest {
+  model?: string;
+  max_tokens?: number;
+  stream?: boolean;
+  system?: string;
+  messages?: Array<{ role: string; content: string | AnthropicContentBlock[] }>;
+}
+
+interface OpenAIChatRequest {
+  model: string;
+  max_tokens?: number;
+  stream: boolean;
+  messages: Array<{ role: string; content: unknown }>;
+}
+
+interface OpenAIChatResponse {
+  choices?: Array<{ message?: { content?: unknown } }>;
+}
+
+/**
+ * Translates the app's Anthropic Messages request into an OpenAI
+ * chat-completions request for Together. The Anthropic "system" string
+ * becomes a leading system message, and base64 image blocks become
+ * data-URL image_url parts.
+ */
+export function anthropicToOpenAIChatRequest(
+  anthropicRequest: AnthropicChatRequest,
+  togetherModelId: string
+): OpenAIChatRequest {
+  const openAIMessages: Array<{ role: string; content: unknown }> = [];
+
+  if (typeof anthropicRequest.system === "string" && anthropicRequest.system.length > 0) {
+    openAIMessages.push({ role: "system", content: anthropicRequest.system });
+  }
+
+  for (const message of anthropicRequest.messages ?? []) {
+    // Conversation-history entries arrive as plain strings.
+    if (typeof message.content === "string") {
+      openAIMessages.push({ role: message.role, content: message.content });
+      continue;
+    }
+
+    // The current user turn arrives as content blocks: labeled screenshots
+    // (base64 images) interleaved with text, then the prompt text.
+    const openAIContentParts: unknown[] = [];
+    for (const contentBlock of message.content) {
+      if (contentBlock.type === "text" && typeof contentBlock.text === "string") {
+        openAIContentParts.push({ type: "text", text: contentBlock.text });
+      } else if (contentBlock.type === "image" && contentBlock.source?.type === "base64") {
+        openAIContentParts.push({
+          type: "image_url",
+          image_url: {
+            url: `data:${contentBlock.source.media_type};base64,${contentBlock.source.data}`,
+          },
+        });
+      }
+    }
+    openAIMessages.push({ role: message.role, content: openAIContentParts });
+  }
+
+  return {
+    model: togetherModelId,
+    max_tokens: anthropicRequest.max_tokens,
+    stream: anthropicRequest.stream === true,
+    messages: openAIMessages,
+  };
+}
+
+/**
+ * Translates a non-streaming OpenAI chat-completions response into the
+ * Anthropic Messages shape the app parses ({content: [{type, text}]}).
+ */
+export function openAIToAnthropicResponse(openAIResponse: OpenAIChatResponse): object {
+  const messageContent = openAIResponse.choices?.[0]?.message?.content;
+  const responseText = typeof messageContent === "string" ? messageContent : "";
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: removeThinkingBlocks(responseText) }],
+  };
+}
+
+const THINKING_OPENING_TAG = "<think>";
+const THINKING_CLOSING_TAG = "</think>";
+
+/**
+ * Strips <think>...</think> reasoning blocks (including an unterminated
+ * trailing block) from a complete response. MiniMax reasoning models emit
+ * these inline through OpenAI-compatible endpoints; the app must only ever
+ * see the final answer text, since the spoken critique goes to TTS.
+ *
+ * Some chat templates pre-fill the opening <think> tag in the prompt, so
+ * the model output begins directly with reasoning and only a closing tag
+ * ever appears (a known behavior of OpenAI-compatible servings of
+ * reasoning models). A closing tag with no earlier opening tag therefore
+ * terminates that implicit reasoning prefix.
+ */
+export function removeThinkingBlocks(text: string): string {
+  let workingText = text;
+
+  const firstClosingTagIndex = workingText.indexOf(THINKING_CLOSING_TAG);
+  const firstOpeningTagIndex = workingText.indexOf(THINKING_OPENING_TAG);
+  if (
+    firstClosingTagIndex !== -1 &&
+    (firstOpeningTagIndex === -1 || firstClosingTagIndex < firstOpeningTagIndex)
+  ) {
+    workingText = workingText.slice(firstClosingTagIndex + THINKING_CLOSING_TAG.length);
+  }
+
+  return workingText
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/<think>[\s\S]*$/, "")
+    .trim();
+}
+
+/**
+ * Streaming-safe <think> block filter. Tags can arrive split across SSE
+ * chunks ("<thi" in one delta, "nk>" in the next), so the filter withholds
+ * any trailing text that could be the start of a tag until the next push
+ * resolves it.
+ *
+ * Until the first tag (or end of stream) it is unknown whether the stream
+ * head is answer text or reasoning from a chat template that pre-filled the
+ * opening <think> tag (in which case only a closing tag ever appears). Text
+ * is withheld during this head phase: an orphan closing tag discards it as
+ * reasoning, an opening tag starts a normal block, and end of stream
+ * releases it as answer text. Withholding costs nothing here because the
+ * app ignores intermediate chunks — it only uses the accumulated final text.
+ */
+export class ThinkingTagFilter {
+  private isHeadPhase = true;
+  private insideThinkingBlock = false;
+  private carryText = "";
+
+  /** Feeds a content delta; returns the displayable text it resolves to. */
+  push(deltaText: string): string {
+    let workingText = this.carryText + deltaText;
+    this.carryText = "";
+    let displayableText = "";
+
+    while (workingText.length > 0) {
+      if (this.isHeadPhase) {
+        const openingTagIndex = workingText.indexOf(THINKING_OPENING_TAG);
+        const closingTagIndex = workingText.indexOf(THINKING_CLOSING_TAG);
+
+        if (closingTagIndex !== -1 && (openingTagIndex === -1 || closingTagIndex < openingTagIndex)) {
+          // Orphan closing tag: everything withheld so far was reasoning
+          // generated after a pre-filled opening tag — drop it.
+          workingText = workingText.slice(closingTagIndex + THINKING_CLOSING_TAG.length);
+          this.isHeadPhase = false;
+          continue;
+        }
+        if (openingTagIndex !== -1) {
+          // Normal block start: the text before the opening tag is answer text.
+          displayableText += workingText.slice(0, openingTagIndex);
+          workingText = workingText.slice(openingTagIndex + THINKING_OPENING_TAG.length);
+          this.isHeadPhase = false;
+          this.insideThinkingBlock = true;
+          continue;
+        }
+        // No tag seen yet: withhold everything until a tag or end of stream
+        // decides whether this head text is reasoning or answer.
+        this.carryText = workingText;
+        return displayableText;
+      }
+
+      if (this.insideThinkingBlock) {
+        const closingTagIndex = workingText.indexOf(THINKING_CLOSING_TAG);
+        if (closingTagIndex !== -1) {
+          workingText = workingText.slice(closingTagIndex + THINKING_CLOSING_TAG.length);
+          this.insideThinkingBlock = false;
+          continue;
+        }
+        // Still inside the block: drop the text, but keep a tail that could
+        // be the start of the closing tag for the next push.
+        this.carryText = longestSuffixThatIsTagPrefix(workingText, THINKING_CLOSING_TAG);
+        return displayableText;
+      }
+
+      const openingTagIndex = workingText.indexOf(THINKING_OPENING_TAG);
+      if (openingTagIndex !== -1) {
+        displayableText += workingText.slice(0, openingTagIndex);
+        workingText = workingText.slice(openingTagIndex + THINKING_OPENING_TAG.length);
+        this.insideThinkingBlock = true;
+        continue;
+      }
+
+      // No tag: emit everything except a tail that could be the start of an
+      // opening tag.
+      const withheldTail = longestSuffixThatIsTagPrefix(workingText, THINKING_OPENING_TAG);
+      displayableText += workingText.slice(0, workingText.length - withheldTail.length);
+      this.carryText = withheldTail;
+      return displayableText;
+    }
+
+    return displayableText;
+  }
+
+  /** Releases any withheld text at end of stream: head-phase text was a
+   *  tag-less answer, a post-head tail was only a potential tag prefix.
+   *  Text withheld inside an unterminated thinking block stays dropped. */
+  flush(): string {
+    const remainingText = this.insideThinkingBlock ? "" : this.carryText;
+    this.carryText = "";
+    return remainingText;
+  }
+}
+
+/** Longest suffix of `text` that is a proper prefix of `tag` (e.g. "abc<th"
+ *  → "<th" for tag "<think>"), or "" when no suffix could start the tag. */
+function longestSuffixThatIsTagPrefix(text: string, tag: string): string {
+  const maximumLength = Math.min(text.length, tag.length - 1);
+  for (let suffixLength = maximumLength; suffixLength >= 1; suffixLength--) {
+    const suffix = text.slice(text.length - suffixLength);
+    if (tag.startsWith(suffix)) {
+      return suffix;
+    }
+  }
+  return "";
+}
+
+/**
+ * Converts Together's OpenAI-style SSE stream into the Anthropic-style SSE
+ * events the app parses: each content delta becomes a content_block_delta /
+ * text_delta event, reasoning is filtered out, and the stream ends with
+ * "data: [DONE]" (which the app treats as end-of-stream).
+ */
+export function createOpenAIToAnthropicSSETransform(): TransformStream<Uint8Array, Uint8Array> {
+  const textDecoder = new TextDecoder();
+  const textEncoder = new TextEncoder();
+  const thinkingTagFilter = new ThinkingTagFilter();
+  let incompleteLineBuffer = "";
+  let hasEmittedDone = false;
+  let hasErrored = false;
+
+  const emitTextDelta = (controller: TransformStreamDefaultController<Uint8Array>, text: string) => {
+    if (text.length === 0) {
+      return;
+    }
+    const anthropicEvent = {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text },
+    };
+    controller.enqueue(textEncoder.encode(`data: ${JSON.stringify(anthropicEvent)}\n\n`));
+  };
+
+  const emitDone = (controller: TransformStreamDefaultController<Uint8Array>) => {
+    if (hasEmittedDone) {
+      return;
+    }
+    hasEmittedDone = true;
+    emitTextDelta(controller, thinkingTagFilter.flush());
+    controller.enqueue(textEncoder.encode("data: [DONE]\n\n"));
+  };
+
+  const processLine = (line: string, controller: TransformStreamDefaultController<Uint8Array>) => {
+    if (!line.startsWith("data: ")) {
+      return;
+    }
+    const payload = line.slice("data: ".length).trim();
+    if (payload === "[DONE]") {
+      emitDone(controller);
+      return;
+    }
+
+    let parsedChunk: { error?: unknown; choices?: Array<{ delta?: { content?: unknown } }> };
+    try {
+      parsedChunk = JSON.parse(payload);
+    } catch {
+      return;
+    }
+
+    // OpenAI-compatible backends can fail mid-generation after the 200
+    // header: the failure arrives in-band as an SSE error payload. Don't
+    // swallow it and synthesize a clean end-of-stream — log it for
+    // `wrangler tail` and error the stream, so the app's existing
+    // response-error path handles it the same way as a pre-stream failure.
+    if (parsedChunk.error !== undefined) {
+      console.error(`[/chat] Together mid-stream error: ${payload}`);
+      hasErrored = true;
+      controller.error(new Error(`Together mid-stream error: ${payload}`));
+      return;
+    }
+
+    // Reasoning arrives either in a separate delta field (ignored here) or
+    // inline as <think> tags in content (removed by the filter) — only the
+    // final answer text is forwarded to the app.
+    const deltaContent = parsedChunk.choices?.[0]?.delta?.content;
+    if (typeof deltaContent === "string" && deltaContent.length > 0) {
+      emitTextDelta(controller, thinkingTagFilter.push(deltaContent));
+    }
+  };
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      if (hasErrored) {
+        return;
+      }
+      incompleteLineBuffer += textDecoder.decode(chunk, { stream: true });
+      let newlineIndex = incompleteLineBuffer.indexOf("\n");
+      while (newlineIndex !== -1 && !hasErrored) {
+        const line = incompleteLineBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+        incompleteLineBuffer = incompleteLineBuffer.slice(newlineIndex + 1);
+        processLine(line, controller);
+        newlineIndex = incompleteLineBuffer.indexOf("\n");
+      }
+    },
+    flush(controller) {
+      if (hasErrored) {
+        return;
+      }
+      if (incompleteLineBuffer.length > 0) {
+        processLine(incompleteLineBuffer.replace(/\r$/, ""), controller);
+      }
+      emitDone(controller);
     },
   });
 }

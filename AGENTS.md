@@ -29,12 +29,12 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 
 | Route | Upstream | Purpose |
 |-------|----------|---------|
-| `POST /chat` | `api.minimax.io/anthropic/v1/messages` | MiniMax-M3 vision + streaming chat (Anthropic Messages format) |
-| `POST /tts` | `api.minimax.io/v1/t2a_v2` | MiniMax TTS — Worker hex-decodes the JSON audio into an MP3 buffer |
+| `POST /chat` | `api.minimax.io/anthropic/v1/messages` (default) or `api.together.xyz/v1/chat/completions` when `CHAT_UPSTREAM = "together"` | MiniMax-M3 vision + streaming chat. The app always speaks Anthropic Messages format; for the Together upstream the Worker translates the request (system → system message, base64 image blocks → data-URL `image_url` parts) and converts the OpenAI-style SSE stream back into Anthropic `content_block_delta` events, filtering out `<think>...</think>` reasoning blocks so they never reach TTS |
+| `POST /tts` | `api.minimax.io/v1/t2a_v2` | MiniMax TTS — Worker hex-decodes the JSON audio into an MP3 buffer (always MiniMax; Together doesn't host MiniMax TTS) |
 | `POST /transcribe-token` | `streaming.assemblyai.com/v3/token` | Fetches a short-lived (480s) AssemblyAI websocket token |
 
-Worker secrets: `MINIMAX_API_KEY`, `ASSEMBLYAI_API_KEY`
-Worker vars: `MINIMAX_VOICE_ID` (a built-in MiniMax voice id), optional `MINIMAX_GROUP_ID` (only if TTS requests fail without it)
+Worker secrets: `MINIMAX_API_KEY`, `ASSEMBLYAI_API_KEY`, `TOGETHER_API_KEY` (only needed when `CHAT_UPSTREAM = "together"`)
+Worker vars: `MINIMAX_VOICE_ID` (a built-in MiniMax voice id), optional `MINIMAX_GROUP_ID` (only if TTS requests fail without it), `CHAT_UPSTREAM` (`"minimax"` default — Together is text-only until they list MiniMax M3, since M2.7 has no vision), `TOGETHER_CHAT_MODEL` (Together serverless model id; update to the M3 id once Together lists it)
 
 ### Key Architecture Decisions
 
@@ -76,7 +76,7 @@ Worker vars: `MINIMAX_VOICE_ID` (a built-in MiniMax voice id), optional `MINIMAX
 | `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
-| `worker/src/index.ts` | ~200 | Cloudflare Worker proxy. Three routes: `/chat` (MiniMax-M3 via the Anthropic-compatible endpoint), `/tts` (MiniMax t2a_v2, hex-decodes the audio), `/transcribe-token` (AssemblyAI temp token). |
+| `worker/src/index.ts` | ~533 | Cloudflare Worker proxy. Three routes: `/chat` (MiniMax-M3 via the Anthropic-compatible endpoint, or Together AI behind `CHAT_UPSTREAM = "together"` with full Anthropic⇄OpenAI request/SSE translation and `<think>`-block filtering), `/tts` (MiniMax t2a_v2, hex-decodes the audio), `/transcribe-token` (AssemblyAI temp token). |
 
 ## Build & Run
 

@@ -199,6 +199,24 @@ struct BlueCursorView: View {
         "found it!"
     ]
 
+    /// The cursor's visual: the "clicky-cursor" image from the asset catalog
+    /// when one has been added, otherwise the built-in blue triangle. The
+    /// custom image must be authored with its tip pointing UP — the flight
+    /// rotation math assumes 0° of rotation means tip-up.
+    @ViewBuilder
+    private var cursorShapeView: some View {
+        if NSImage(named: "clicky-cursor") != nil {
+            Image("clicky-cursor")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 16, height: 16)
+        } else {
+            Triangle()
+                .fill(DS.Colors.overlayCursorBlue)
+                .frame(width: 16, height: 16)
+        }
+    }
+
     var body: some View {
         ZStack {
             // Nearly transparent background (helps with compositing)
@@ -320,9 +338,7 @@ struct BlueCursorView: View {
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
             // timer controls position directly at 60fps for a smooth arc flight.
-            Triangle()
-                .fill(DS.Colors.overlayCursorBlue)
-                .frame(width: 16, height: 16)
+            cursorShapeView
                 .rotationEffect(.degrees(triangleRotationDegrees))
                 .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
                 .scaleEffect(buddyFlightScale)
