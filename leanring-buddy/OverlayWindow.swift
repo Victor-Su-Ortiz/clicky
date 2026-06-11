@@ -210,6 +210,11 @@ struct BlueCursorView: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: 16, height: 16)
+                // The artwork's tip points up-left (~45°), but the flight
+                // rotation math assumes the tip points straight up at 0° —
+                // this inner offset normalizes the artwork to tip-up so the
+                // dynamic rotation aims the arrow correctly.
+                .rotationEffect(.degrees(45))
         } else {
             Triangle()
                 .fill(DS.Colors.overlayCursorBlue)
