@@ -714,6 +714,7 @@ final class CompanionManager: ObservableObject {
     - if you gave the user a [PROMPT] block earlier in this conversation, implement THAT — don't invent a new direction mid-flight.
     - your spoken text should be a quick summary of what you changed, ending by telling the user to reload the page and ask for a re-review.
     - never write an [EDIT] block unless the user asked you to make changes. if they ask you to fix things but their message has no project files, say you couldn't see their project files and suggest checking the project folder setting in clicky's menu bar panel.
+    - even if your earlier replies in this conversation used [PROMPT] blocks, that never means the current turn should: when the user asks you to apply the changes, [EDIT] blocks REPLACE the [PROMPT] block entirely. do not write both, and do not tell the user to paste anything into a coding agent — you ARE making the changes.
     - a long file may end with a "[file truncated ...]" marker. you can't see anything past it — never write a SEARCH against that hidden part.
     - after edits you usually have nothing on screen to point at — end with [POINT:none].
 
@@ -818,6 +819,22 @@ final class CompanionManager: ObservableObject {
                 }.value
 
                 guard !Task.isCancelled else { return }
+
+                // Console diagnostics for the "fix it" path: whether [EDIT]
+                // fixes are even possible this turn depends entirely on files
+                // being attached, and a configured-but-empty folder would
+                // otherwise fail silently (the model just falls back to a
+                // [PROMPT] block).
+                if let configuredProjectFolderURL = projectFolderURLForRequest {
+                    if webProjectFiles.isEmpty {
+                        print("⚠️ Project folder is set but no source files were gathered — [EDIT] fixes are unavailable this turn: \(configuredProjectFolderURL.path)")
+                    } else {
+                        print("📁 Attached \(webProjectFiles.count) project file(s) from \(configuredProjectFolderURL.lastPathComponent): \(webProjectFiles.map(\.relativePath).joined(separator: ", "))")
+                    }
+                } else {
+                    print("📁 No project folder configured — [EDIT] fixes are unavailable; review prompts only")
+                }
+
                 let projectFilesContextSection: String
                 if webProjectFiles.isEmpty {
                     projectFilesContextSection = ""
@@ -833,12 +850,23 @@ final class CompanionManager: ObservableObject {
                 // The model reliably follows the response format when reminded
                 // in the current turn, but tends to drop format scaffolding
                 // (the [PROMPT]/[EDIT] blocks and [POINT:...] tags) when the
-                // instruction only lives in the system prompt. Conversation
-                // history stores the raw transcript, so this reminder never
-                // accumulates across turns.
+                // instruction only lives in the system prompt. The reminder is
+                // chosen by whether project files are ACTUALLY attached —
+                // leaving that check to the model proved unreliable: with
+                // prompt-first phrasing and a history full of [PROMPT]-shaped
+                // responses, it answered "fix it" with another [PROMPT] block
+                // instead of [EDIT] blocks. Conversation history stores the
+                // raw transcript, so this reminder never accumulates across
+                // turns.
+                let formatReminder: String
+                if webProjectFiles.isEmpty {
+                    formatReminder = "\n\n(format reminder: short spoken critique first; if the page needs work, include the full improvement prompt wrapped in [PROMPT]...[/PROMPT]. this message contains NO project source files, so never emit [EDIT:...] blocks — if the user asked you to apply fixes yourself, tell them you couldn't see their project files and to pick the project folder in clicky's menu bar panel. then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
+                } else {
+                    formatReminder = "\n\n(format reminder: the user's project source files are included above. if this message asks you to make or apply the changes yourself — 'fix it', 'apply that', 'do it', 'make those changes' — respond with [EDIT:path] search/replace blocks and never with an improvement-prompt block, even if earlier replies in this conversation used one. if it's a review question instead and the page needs work, include the normal [PROMPT]...[/PROMPT] improvement prompt; if the page is fine or it's a general question, no block at all. short spoken critique first, then the blocks, then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
+                }
                 let userPromptWithFormatReminder = projectFilesContextSection
                     + transcript
-                    + "\n\n(format reminder: short spoken critique first; if the page needs work, include the full improvement prompt wrapped in [PROMPT]...[/PROMPT] — but if the user asked you to APPLY the fixes and you have the project files, emit [EDIT:path] search/replace blocks instead; then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
+                    + formatReminder
 
                 let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
@@ -1481,7 +1509,32 @@ final class CompanionManager: ObservableObject {
         var remainingResponseText = responseText.replacingOccurrences(of: "\r\n", with: "\n")
         var improvementPromptText: String? = nil
 
-        if let openingMarkerRange = remainingResponseText.range(of: improvementPromptOpeningMarker) {
+        // The opener must start a line (mirroring the [EDIT:] opener rule) —
+        // a prose mention like "no [PROMPT] block this time" must not open a
+        // block, because the unterminated-block salvage below would swallow
+        // everything after it, including valid [EDIT:...] blocks, and the
+        // user would see "prompt copied" while no edits were applied. A
+        // mid-line opener is honored only when its [/PROMPT] closer exists,
+        // so a genuine block the model failed to line-anchor still extracts
+        // instead of leaking its whole body into the spoken text.
+        func findImprovementPromptOpeningMarker(in text: String) -> Range<String.Index>? {
+            var cursorIndex = text.startIndex
+            while let candidateRange = text.range(of: improvementPromptOpeningMarker, range: cursorIndex..<text.endIndex) {
+                let isAtLineStart = candidateRange.lowerBound == text.startIndex
+                    || text[text.index(before: candidateRange.lowerBound)] == "\n"
+                if isAtLineStart { return candidateRange }
+                cursorIndex = candidateRange.upperBound
+            }
+            // No line-anchored opener — accept a mid-line one only when the
+            // block is provably real (its closer is present after it).
+            if let unanchoredRange = text.range(of: improvementPromptOpeningMarker),
+               text.range(of: improvementPromptClosingMarker, range: unanchoredRange.upperBound..<text.endIndex) != nil {
+                return unanchoredRange
+            }
+            return nil
+        }
+
+        if let openingMarkerRange = findImprovementPromptOpeningMarker(in: remainingResponseText) {
             let textAfterOpeningMarker = remainingResponseText[openingMarkerRange.upperBound...]
 
             if let closingMarkerRange = textAfterOpeningMarker.range(of: improvementPromptClosingMarker) {
