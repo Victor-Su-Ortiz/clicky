@@ -11,3 +11,15 @@ MINIMAX_VOICE_ID = "English_FriendlyPerson"
 # `npx wrangler deploy`. Requires the TOGETHER_API_KEY secret.
 CHAT_UPSTREAM = "minimax"
 TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7"
+# Which upstream serves /tts: "minimax" (default) or "together".
+# The Together path serves the SAME MiniMax speech model but needs a RUNNING
+# dedicated endpoint on the Together account first (~$6.49/hr while up —
+# MiniMax speech is not serverless on Together). Demo-day recipe in NOTES.md:
+# start the endpoint, flip this to "together", `npx wrangler deploy`; flip
+# back + redeploy when the endpoint stops. Requires the TOGETHER_API_KEY secret.
+TTS_UPSTREAM = "minimax"
+TOGETHER_TTS_MODEL = "minimax/speech-2.8-turbo"
+# Together's voice catalog for this model does NOT include MiniMax-direct ids
+# like English_FriendlyPerson. English options: English_Aussie_Bloke,
+# English_ManWithDeepVoice, English_radiant_girl.
+TOGETHER_TTS_VOICE = "English_radiant_girl"

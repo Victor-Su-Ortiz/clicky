@@ -10,7 +10,10 @@
  *                 CHAT_UPSTREAM = "together" (the Worker translates the
  *                 request body and SSE stream both ways, so the app always
  *                 speaks Anthropic Messages format regardless of upstream)
- *   POST /tts   → MiniMax text-to-speech API (t2a_v2)
+ *   POST /tts   → MiniMax text-to-speech API (t2a_v2), or MiniMax speech on
+ *                 Together AI when TTS_UPSTREAM = "together" (requires a
+ *                 running dedicated endpoint — MiniMax speech models are not
+ *                 serverless on Together)
  *   POST /stt   → NVIDIA Parakeet speech-to-text on Together AI — the app
  *                 sends a raw 16kHz mono WAV body and gets back {"text": ...}
  *   GET  /stt-stream → websocket relay to Together's realtime transcription
@@ -36,6 +39,18 @@ interface Env {
   // Together serverless model id, e.g. "MiniMaxAI/MiniMax-M2.7". Change to
   // the M3 id once Together lists it.
   TOGETHER_CHAT_MODEL?: string;
+  // Which upstream serves /tts: "minimax" (default) or "together".
+  // The Together path serves the same MiniMax speech model but requires a
+  // RUNNING dedicated endpoint on the Together account (~$6.49/hr while up;
+  // MiniMax speech models are not serverless there) — flip only after
+  // starting it, and flip back to "minimax" once it stops.
+  TTS_UPSTREAM?: string;
+  TOGETHER_TTS_MODEL?: string;
+  // Voice id for the Together TTS path. Together's catalog for the MiniMax
+  // speech model does NOT include the MiniMax-direct voice ids (e.g.
+  // English_FriendlyPerson) — its English voices are English_Aussie_Bloke,
+  // English_ManWithDeepVoice, and English_radiant_girl.
+  TOGETHER_TTS_VOICE?: string;
 }
 
 const DEFAULT_TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7";
@@ -687,6 +702,10 @@ async function handleTTS(request: Request, env: Env): Promise<Response> {
     );
   }
 
+  if (env.TTS_UPSTREAM === "together") {
+    return handleTTSViaTogether(textToSpeak, env);
+  }
+
   const ttsURL = env.MINIMAX_GROUP_ID
     ? `https://api.minimax.io/v1/t2a_v2?GroupId=${env.MINIMAX_GROUP_ID}`
     : "https://api.minimax.io/v1/t2a_v2";
@@ -744,6 +763,52 @@ async function handleTTS(request: Request, env: Env): Promise<Response> {
 
   const audioBuffer = hexDecodeToArrayBuffer(result.data.audio);
   return new Response(audioBuffer, {
+    status: 200,
+    headers: { "content-type": "audio/mpeg" },
+  });
+}
+
+/**
+ * MiniMax speech on Together AI's OpenAI-compatible speech endpoint.
+ * Unlike MiniMax's t2a_v2 (hex-encoded audio inside a JSON envelope),
+ * Together returns the MP3 bytes directly, so no decoding is needed —
+ * the app receives audio/mpeg either way and can't tell the upstreams
+ * apart. Requires a RUNNING dedicated endpoint for the model on the
+ * Together account; without one, Together replies 400 "Unable to access
+ * non-serverless model", which is passed through and logged here.
+ */
+async function handleTTSViaTogether(textToSpeak: string, env: Env): Promise<Response> {
+  if (!env.TOGETHER_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "TTS_UPSTREAM is \"together\" but the TOGETHER_API_KEY secret is not set" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const response = await fetch("https://api.together.xyz/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.TOGETHER_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: env.TOGETHER_TTS_MODEL || "minimax/speech-2.8-turbo",
+      input: textToSpeak,
+      voice: env.TOGETHER_TTS_VOICE || "English_radiant_girl",
+      response_format: "mp3",
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/tts] Together TTS error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(response.body, {
     status: 200,
     headers: { "content-type": "audio/mpeg" },
   });

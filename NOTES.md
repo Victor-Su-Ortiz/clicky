@@ -1,4 +1,19 @@
-# Status notes — 2026-06-10 (updated 2026-06-12)
+# Status notes — 2026-06-10 (updated 2026-06-11)
+
+## TTS via Together (built + deployed, dormant — demo-day flip)
+
+The Worker now has a `TTS_UPSTREAM` toggle (mirrors `CHAT_UPSTREAM`). It is deployed set to `"minimax"`, so TTS behavior is unchanged (MiniMax direct, `English_FriendlyPerson`). The `"together"` path serves the **same model** (`minimax/speech-2.8-turbo`) through Together AI — but MiniMax speech is NOT serverless on Together (verified against the live API, including id aliases and the stream flag): it requires a **dedicated endpoint**, 1× H100 at 10.82¢/min ≈ **$6.49/hr, billed only while running**.
+
+**Demo-day recipe (~5 min):**
+
+1. Start the endpoint: https://api.together.ai/models/minimax/speech-2.8-turbo → "Create dedicated endpoint" → 1× H100 → set the inactive/auto-stop timeout to ~10 min. First spin-up takes a few minutes.
+2. Flip: edit `worker/wrangler.toml` → `TTS_UPSTREAM = "together"`, then `cd worker && npx wrangler deploy`.
+3. Verify: `curl -s -X POST https://clicky-proxy.minimax-together.workers.dev/tts -H 'Content-Type: application/json' -d '{"text":"hi"}' -o /tmp/check.mp3 && file /tmp/check.mp3` → should say MPEG audio.
+4. After the demo: stop the endpoint in the Together dashboard (or let auto-stop catch it), flip `TTS_UPSTREAM` back to `"minimax"`, redeploy.
+
+**Voice caveat:** Together's catalog for this model does not include `English_FriendlyPerson`. `TOGETHER_TTS_VOICE` is preset to `English_radiant_girl` (alternatives: `English_Aussie_Bloke`, `English_ManWithDeepVoice`). Once the endpoint is live, try setting `English_FriendlyPerson` anyway — the catalog may just be the validated subset.
+
+**Verified (2026-06-11):** the Together branch was exercised live via `wrangler dev` (auth + request shape correct — Together returns the expected "non-serverless model" 400 until an endpoint runs, passed through and logged); after deploy (version `09455c40`), production `/tts` (MiniMax MP3) and `/chat` were regression-checked. Chat M3 re-checked the same day: still absent from Together (no serverless listing, no dedicated hardware), so chat stays on MiniMax direct.
 
 ## ✅ Worker deployed (2026-06-12) — STT is live
 

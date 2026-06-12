@@ -30,12 +30,12 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 | Route | Upstream | Purpose |
 |-------|----------|---------|
 | `POST /chat` | `api.minimax.io/anthropic/v1/messages` (default) or `api.together.xyz/v1/chat/completions` when `CHAT_UPSTREAM = "together"` | MiniMax-M3 vision + streaming chat. The app always speaks Anthropic Messages format; for the Together upstream the Worker translates the request (system → system message, base64 image blocks → data-URL `image_url` parts) and converts the OpenAI-style SSE stream back into Anthropic `content_block_delta` events, filtering out `<think>...</think>` reasoning blocks so they never reach TTS |
-| `POST /tts` | `api.minimax.io/v1/t2a_v2` | MiniMax TTS — Worker hex-decodes the JSON audio into an MP3 buffer (always MiniMax; Together doesn't host MiniMax TTS) |
+| `POST /tts` | `api.minimax.io/v1/t2a_v2` (default) or `api.together.xyz/v1/audio/speech` when `TTS_UPSTREAM = "together"` | MiniMax TTS — on the MiniMax path the Worker hex-decodes the JSON-enveloped audio into an MP3 buffer; the Together path serves the same `minimax/speech-2.8-turbo` and returns MP3 bytes directly (no decode) but requires a RUNNING dedicated endpoint on the Together account (~$6.49/hr — MiniMax speech is not serverless there; flip recipe in NOTES.md) |
 | `POST /stt` | `api.together.xyz/v1/audio/transcriptions` | NVIDIA Parakeet speech-to-text — the app sends a raw 16kHz mono WAV body; the Worker wraps it in the multipart form (model/language/format live Worker-side) and passes back `{"text": ...}` |
 | `POST /transcribe-token` | `streaming.assemblyai.com/v3/token` | Fetches a short-lived (480s) AssemblyAI websocket token (only used when `VoiceTranscriptionProvider = "assemblyai"`) |
 
 Worker secrets: `MINIMAX_API_KEY`, `ASSEMBLYAI_API_KEY`, `TOGETHER_API_KEY` (required for `/stt` — the active STT provider — and for `CHAT_UPSTREAM = "together"`)
-Worker vars: `MINIMAX_VOICE_ID` (a built-in MiniMax voice id), optional `MINIMAX_GROUP_ID` (only if TTS requests fail without it), `CHAT_UPSTREAM` (`"minimax"` default — Together is text-only until they list MiniMax M3, since M2.7 has no vision), `TOGETHER_CHAT_MODEL` (Together serverless model id; update to the M3 id once Together lists it)
+Worker vars: `MINIMAX_VOICE_ID` (a built-in MiniMax voice id), optional `MINIMAX_GROUP_ID` (only if TTS requests fail without it), `CHAT_UPSTREAM` (`"minimax"` default — Together is text-only until they list MiniMax M3, since M2.7 has no vision), `TOGETHER_CHAT_MODEL` (Together serverless model id; update to the M3 id once Together lists it), `TTS_UPSTREAM` (`"minimax"` default; `"together"` needs a running dedicated endpoint first), `TOGETHER_TTS_MODEL`, `TOGETHER_TTS_VOICE` (Together's catalog lacks the MiniMax-direct voice ids — English options are `English_Aussie_Bloke` / `English_ManWithDeepVoice` / `English_radiant_girl`)
 
 ### Key Architecture Decisions
 
@@ -80,7 +80,7 @@ Worker vars: `MINIMAX_VOICE_ID` (a built-in MiniMax voice id), optional `MINIMAX
 | `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
-| `worker/src/index.ts` | ~758 | Cloudflare Worker proxy. Five routes: `/chat` (MiniMax-M3 via the Anthropic-compatible endpoint, or Together AI behind `CHAT_UPSTREAM = "together"` with full Anthropic⇄OpenAI request/SSE translation and `<think>`-block filtering), `/tts` (MiniMax t2a_v2, hex-decodes the audio), `/stt` (NVIDIA Parakeet on Together AI, raw WAV in → `{"text"}` out), `/stt-stream` (websocket relay to Together's realtime Parakeet endpoint with the API key injected — handled before the POST-only guard since upgrades are GET), `/transcribe-token` (AssemblyAI temp token). |
+| `worker/src/index.ts` | ~823 | Cloudflare Worker proxy. Five routes: `/chat` (MiniMax-M3 via the Anthropic-compatible endpoint, or Together AI behind `CHAT_UPSTREAM = "together"` with full Anthropic⇄OpenAI request/SSE translation and `<think>`-block filtering), `/tts` (MiniMax t2a_v2, hex-decodes the audio; or MiniMax speech on Together behind `TTS_UPSTREAM = "together"`, dedicated endpoint required), `/stt` (NVIDIA Parakeet on Together AI, raw WAV in → `{"text"}` out), `/stt-stream` (websocket relay to Together's realtime Parakeet endpoint with the API key injected — handled before the POST-only guard since upgrades are GET), `/transcribe-token` (AssemblyAI temp token). |
 
 ## Build & Run
 
