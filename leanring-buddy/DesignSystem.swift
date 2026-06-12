@@ -149,6 +149,9 @@ enum DS {
         static let clickyBrandPink = Color(hex: "#EE2C90")
         static let clickyBrandOrange = Color(hex: "#FF5E1B")
 
+        /// The glow around the cursor image in the screen overlay.
+        static let clickyCursorGlowRed = Color(hex: "#FF2222")
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —

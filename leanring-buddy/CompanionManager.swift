@@ -710,6 +710,7 @@ final class CompanionManager: ObservableObject {
 
     - the SEARCH text must be copied EXACTLY from the file content you were given — every space, indent, and line break — and must be unique enough to match only the place you mean. it is matched literally and replaced at its first occurrence.
     - keep each edit surgical (a tag, a rule block, one section). use several small [EDIT] blocks rather than one giant one.
+    - a block ends at its >>>>>>> REPLACE line. there is NO [/EDIT] closing tag in this format — never write [/EDIT]. never paste a whole rewritten file as one block; express even a big redesign as a series of search/replace edits, each anchored to exact lines that exist in the file. blocks in any other shape are rejected by the software and nothing gets applied.
     - only edit files that were included in the message, and write each file's relative path exactly as labeled.
     - if you gave the user a [PROMPT] block earlier in this conversation, implement THAT — don't invent a new direction mid-flight.
     - your spoken text should be a quick summary of what you changed, ending by telling the user to reload the page and ask for a re-review.
@@ -862,7 +863,7 @@ final class CompanionManager: ObservableObject {
                 if webProjectFiles.isEmpty {
                     formatReminder = "\n\n(format reminder: short spoken critique first; if the page needs work, include the full improvement prompt wrapped in [PROMPT]...[/PROMPT]. this message contains NO project source files, so never emit [EDIT:...] blocks — if the user asked you to apply fixes yourself, tell them you couldn't see their project files and to pick the project folder in clicky's menu bar panel. then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
                 } else {
-                    formatReminder = "\n\n(format reminder: the user's project source files are included above. if this message asks you to make or apply the changes yourself — 'fix it', 'apply that', 'do it', 'make those changes' — respond with [EDIT:path] search/replace blocks and never with an improvement-prompt block, even if earlier replies in this conversation used one. if it's a review question instead and the page needs work, include the normal [PROMPT]...[/PROMPT] improvement prompt; if the page is fine or it's a general question, no block at all. short spoken critique first, then the blocks, then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
+                    formatReminder = "\n\n(format reminder: the user's project source files are included above. if this message asks you to make or apply the changes yourself — 'fix it', 'apply that', 'do it', 'make those changes' — respond with [EDIT:path] search/replace blocks and never with an improvement-prompt block, even if earlier replies in this conversation used one. each block is exactly: [EDIT:path] on its own line, then a line <<<<<<< SEARCH, the exact existing lines copied verbatim from the file, a line =======, the replacement lines, and a line >>>>>>> REPLACE. there is NO [/EDIT] tag and whole-file rewrites are invalid — if an earlier reply in this conversation used any other edit shape, it was malformed and nothing was applied; use this exact format. if it's a review question instead and the page needs work, include the normal [PROMPT]...[/PROMPT] improvement prompt; if the page is fine or it's a general question, no block at all. short spoken critique first, then the blocks, then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
                 }
                 let userPromptWithFormatReminder = projectFilesContextSection
                     + transcript
@@ -984,9 +985,29 @@ final class CompanionManager: ObservableObject {
                 // synthetic [POINT:none] appended so every history entry
                 // demonstrates the required format; no such backfill for the
                 // prompt block because it is optional by design.
-                let assistantResponseForHistory = fullResponseText.contains("[POINT:")
-                    ? fullResponseText
-                    : fullResponseText + " [POINT:none]"
+                //
+                // EXCEPTION: when any [EDIT] block was dropped as malformed,
+                // the raw response demonstrates a BROKEN edit grammar (e.g.
+                // a [/EDIT]-terminated whole-file rewrite, which the parser
+                // rejects). Stored verbatim it becomes an in-context example
+                // that teaches the model to repeat the bad format on the next
+                // fix-it turn — measured: with a malformed example in history
+                // the model reproduced the bad shape 3/3 times DESPITE a
+                // reminder explicitly forbidding it, versus correct format 2/2
+                // with clean history. In-context examples beat instructions,
+                // so the bad shape must never re-enter the context. The
+                // appended note keeps the entry truthful — without it the
+                // spoken text ("done — i rebuilt...") would claim changes that
+                // never landed, and the model would skip redoing them.
+                let assistantResponseForHistory: String
+                if parseResult.droppedEditBlockCount > 0 {
+                    assistantResponseForHistory = spokenText
+                        + "\n(note: the edit blocks in this reply were malformed, so NONE of them were applied to the files — the changes described above did not happen and still need to be made) [POINT:none]"
+                } else {
+                    assistantResponseForHistory = fullResponseText.contains("[POINT:")
+                        ? fullResponseText
+                        : fullResponseText + " [POINT:none]"
+                }
                 conversationHistory.append((
                     userTranscript: transcript,
                     assistantResponse: assistantResponseForHistory
