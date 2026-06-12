@@ -143,6 +143,12 @@ enum DS {
         /// (screen overlay vs in-app UI).
         static let overlayCursorBlue = Color(hex: "#3380FF")
 
+        /// Gradient endpoints sampled from the clicky-cursor artwork
+        /// (Assets.xcassets/clicky-cursor) so the overlay's audio visuals
+        /// (waveform, spinner) match the custom cursor image.
+        static let clickyBrandPink = Color(hex: "#EE2C90")
+        static let clickyBrandOrange = Color(hex: "#FF5E1B")
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —

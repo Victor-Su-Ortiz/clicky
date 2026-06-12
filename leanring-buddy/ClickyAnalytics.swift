@@ -104,6 +104,15 @@ enum ClickyAnalytics {
         ])
     }
 
+    /// The model emitted [EDIT:...] blocks and Clicky applied them to the
+    /// user's project files.
+    static func trackCodeEditsApplied(appliedCount: Int, failedCount: Int) {
+        PostHogSDK.shared.capture("code_edits_applied", properties: [
+            "applied_count": appliedCount,
+            "failed_count": failedCount
+        ])
+    }
+
     /// The model's response included a [POINT:x,y:label] coordinate tag,
     /// so the buddy is flying to point at a UI element.
     static func trackElementPointed(elementLabel: String?) {

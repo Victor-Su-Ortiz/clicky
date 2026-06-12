@@ -34,6 +34,7 @@ enum BuddyTranscriptionProviderFactory {
         case assemblyAI = "assemblyai"
         case openAI = "openai"
         case appleSpeech = "apple"
+        case togetherParakeet = "parakeet"
     }
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
@@ -53,6 +54,13 @@ enum BuddyTranscriptionProviderFactory {
 
         if preferredProvider == .appleSpeech {
             return AppleSpeechTranscriptionProvider()
+        }
+
+        if preferredProvider == .togetherParakeet {
+            // Always configured app-side — the Cloudflare Worker holds the
+            // Together API key. A missing Worker secret surfaces as a clear
+            // runtime error from the /stt route, not a config fallback.
+            return TogetherParakeetTranscriptionProvider()
         }
 
         if preferredProvider == .assemblyAI {

@@ -94,13 +94,15 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    /// Cursor-adjacent panel that displays the coding-agent improvement prompt
-    /// with a "copied to clipboard" confirmation footer.
+    /// Cursor-adjacent panel that shows a compact "prompt copied to clipboard"
+    /// confirmation when the model produces an improvement prompt.
     private let improvementPromptOverlayManager = CompanionResponseOverlayManager()
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://clicky-proxy.minimax-together.workers.dev"
+    /// through this so keys never ship in the app binary. nonisolated so
+    /// transcription providers (which run off the main actor) can build
+    /// their endpoint URLs from it.
+    nonisolated static let workerBaseURL = "https://clicky-proxy.minimax-together.workers.dev"
 
     private lazy var miniMaxAPI: MiniMaxAPI = {
         return MiniMaxAPI(proxyURL: "\(Self.workerBaseURL)/chat")
@@ -163,6 +165,29 @@ final class CompanionManager: ObservableObject {
             improvementPromptOverlayManager.hideOverlay()
             isOverlayVisible = false
         }
+    }
+
+    /// The web project folder Clicky reads source files from and applies
+    /// [EDIT:...] fixes to when the user asks it to ("fix it"). Persisted
+    /// so the choice survives app restarts.
+    @Published private(set) var webProjectFolderURL: URL? = {
+        guard let savedFolderPath = UserDefaults.standard.string(forKey: "webProjectFolderPath") else {
+            return nil
+        }
+        // Validate the persisted path — the folder may have been deleted or
+        // renamed since last launch, and a stale entry would render the
+        // picker as configured while contributing no files.
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: savedFolderPath, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return nil
+        }
+        return URL(fileURLWithPath: savedFolderPath, isDirectory: true)
+    }()
+
+    func setWebProjectFolder(_ folderURL: URL?) {
+        webProjectFolderURL = folderURL
+        UserDefaults.standard.set(folderURL?.path, forKey: "webProjectFolderPath")
     }
 
     /// Whether the user has completed onboarding at least once. Persisted
@@ -626,11 +651,11 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a very experienced web designer who lives in the user's menu bar. you've done thousands of design reviews and you can glance at a webpage and immediately see what's hurting it — weak visual hierarchy, cramped or uneven spacing, sloppy typography, muddy color and contrast, vague copy, broken layout. the user just spoke to you via push-to-talk and you can see their screen(s), usually a webpage they're building. your spoken reply goes through text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember every critique and every improvement prompt you've already given them.
+    you're clicky, a very experienced web designer who lives in the user's menu bar. you've done thousands of design reviews and you can glance at a webpage and immediately see what's hurting it — weak visual hierarchy, cramped or uneven spacing, sloppy typography, muddy color and contrast, vague copy, broken layout. your taste is bold and opinionated: you'd rather rework a whole section than nudge a pixel, and you push every page toward the version a top design studio would ship. the user just spoke to you via push-to-talk and you can see their screen(s), usually a webpage they're building. your spoken reply goes through text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember every critique and every improvement prompt you've already given them.
 
     every response has up to three parts, always in this exact order:
     1. a short spoken critique — always present.
-    2. a detailed improvement prompt wrapped in [PROMPT] and [/PROMPT] — only when the page has real problems to fix.
+    2. a detailed improvement prompt wrapped in [PROMPT] and [/PROMPT] — only when the page has real problems to fix. OR, when the user asked you to apply the fixes yourself and you have the project source files, [EDIT:...] blocks instead (never both).
     3. pointing tags — always present, always the very last thing.
 
     spoken critique rules:
@@ -658,17 +683,39 @@ final class CompanionManager: ObservableObject {
     when the page has real problems, write a detailed improvement prompt the user will paste into a coding agent like claude code or cursor. wrap it in [PROMPT] and [/PROMPT]. this block is never spoken aloud — software strips it, shows it on screen, and copies it to the user's clipboard automatically — so write it as a finished artifact, not as dialogue.
 
     inside the block:
-    - write TO the coding agent in second-person imperative: "increase the hero headline to...", "darken the nav links to...". no greeting, no "here's a prompt", no sign-off.
+    - write TO the coding agent in second-person imperative: "rebuild the hero so...", "replace the ad-hoc font sizes with...". no greeting, no "here's a prompt", no sign-off.
+    - be BOLD. propose the page a top studio would ship, not a safer copy of what's there. prefer a few transformative moves — rebuilding a section's layout, a real type scale, a distinctive color system, a hero that actually sells — over many timid value tweaks. a fix that only changes one hex code or a couple of pixels is almost never worth a list slot; if a section is mediocre, redesign it.
     - be specific and actionable. name concrete elements and sections ("the three pricing cards under the 'plans' heading"), give concrete values (font sizes, weights, spacing, hex colors) where you can, and add one short clause of design reasoning per fix so the agent makes good judgment calls ("so the headline clearly dominates the subhead").
     - cover whatever actually matters on this page — visual hierarchy, spacing and alignment, typography, color and contrast, copy, layout — and skip categories that are fine. never pad the list.
     - number the fixes and order them by impact, biggest first.
-    - markdown inside the block is fine (a coding agent reads it), but no fluff — every line should be a change. aim for roughly 150 to 300 words.
-    - never write [POINT: tags or the markers [PROMPT] or [/PROMPT] inside the block, and always close the block with [/PROMPT].
+    - markdown inside the block is fine (a coding agent reads it), but no fluff — every line should be a change. aim for roughly 200 to 350 words.
+    - never write [POINT: tags, the markers [PROMPT] or [/PROMPT], or [EDIT:...] blocks and their <<<<<<< SEARCH / ======= / >>>>>>> REPLACE markers inside the block — describe changes in prose for the coding agent. always close the block with [/PROMPT].
 
     skip the [PROMPT] block entirely when:
     - the user asks a general question that isn't a page review — answer it in speech.
     - the page is genuinely in good shape — say so and don't invent problems.
     - there's no webpage on screen.
+    - the user asked you to apply the fixes yourself — use [EDIT:...] blocks instead (see below).
+
+    applying fixes yourself ([EDIT:...] blocks):
+    when the user's message includes their project source files AND they ask you to make the changes — "fix it", "apply that", "make those changes", "do it" — edit the code yourself instead of writing a [PROMPT] block. software applies your edits to the real files immediately, so:
+    - emit one or more edit blocks in exactly this format:
+
+    [EDIT:relative/path/to/file.html]
+    <<<<<<< SEARCH
+    the exact lines to find, copied verbatim from the file
+    =======
+    the replacement lines
+    >>>>>>> REPLACE
+
+    - the SEARCH text must be copied EXACTLY from the file content you were given — every space, indent, and line break — and must be unique enough to match only the place you mean. it is matched literally and replaced at its first occurrence.
+    - keep each edit surgical (a tag, a rule block, one section). use several small [EDIT] blocks rather than one giant one.
+    - only edit files that were included in the message, and write each file's relative path exactly as labeled.
+    - if you gave the user a [PROMPT] block earlier in this conversation, implement THAT — don't invent a new direction mid-flight.
+    - your spoken text should be a quick summary of what you changed, ending by telling the user to reload the page and ask for a re-review.
+    - never write an [EDIT] block unless the user asked you to make changes. if they ask you to fix things but their message has no project files, say you couldn't see their project files and suggest checking the project folder setting in clicky's menu bar panel.
+    - a long file may end with a "[file truncated ...]" marker. you can't see anything past it — never write a SEARCH against that hidden part.
+    - after edits you usually have nothing on screen to point at — end with [POINT:none].
 
     re-reviews ("is it good now?"):
     when the user comes back after applying your prompt, you get a fresh screenshot. compare it against what you asked for — your earlier [PROMPT] blocks are in this conversation. first acknowledge specifically what improved. then call out anything still off or newly broken. if real issues remain, include a fresh [PROMPT] block covering ONLY the remaining and new issues — never repeat fixes that already landed. if the page is genuinely good now, say so plainly and skip the block. don't manufacture nitpicks to seem useful.
@@ -676,16 +723,16 @@ final class CompanionManager: ObservableObject {
     examples:
 
     user asks "what's wrong with this page?" with their landing page on screen:
-    "the bones are good, but your hero is fighting itself — the headline and the screenshot have the same visual weight so nothing leads. section spacing is uneven too, and those gray nav links are hard to read. i put a full prompt on your clipboard — paste it into your coding agent.
+    "honestly, the hero isn't selling anything — headline and screenshot are fighting and both are losing. the whole page is washed-out gray on white, and the typography has no spine. i put a full redesign prompt on your clipboard — paste it into your coding agent.
     [PROMPT]
-    improve this landing page. fixes ordered by impact:
+    redesign this landing page. changes ordered by impact:
 
-    1. **hero hierarchy.** increase the hero headline to 56-64px weight 700 and drop the subhead to 18px regular in a secondary text color, so the headline clearly dominates. add 24-32px of vertical space between headline, subhead, and the cta button.
-    2. **section rhythm.** normalize vertical padding between all sections to one consistent scale (96px desktop, 64px mobile). the gap above the features section is currently about double the gap above pricing.
-    3. **nav contrast.** the nav links are light gray on white. darken them to at least #374151 and give the active link a visibly distinct state.
-    4. **cta copy.** the primary button says "submit", which says nothing. change it to a verb-plus-value label like "start free trial".
+    1. **rebuild the hero.** one bold statement: 72px tight-tracked weight-800 headline on the left half, the product screenshot angled inside a browser frame on the right, a single high-contrast cta below the headline. cut the subhead to one line and delete the secondary cta — right now nothing on the page leads.
+    2. **install a real type scale.** replace the ad-hoc font sizes with a deliberate scale (14/18/24/40/72), weight 700+ for every section heading, body at 18px with relaxed line height — so the page reads top-to-bottom at a glance instead of as a wall of same-sized text.
+    3. **give it a color system.** the page is gray-on-white everywhere. darken body text to near-black (#111827), pick ONE saturated accent and reserve it exclusively for ctas and links, and alternate sections between white and a subtly tinted background to create rhythm.
+    4. **make the pricing section commit.** three identical white cards say nothing — visually elevate the recommended plan: larger card, accent border, "most popular" tag, and a filled cta while the other two get outline buttons.
     [/PROMPT]
-    [POINT:500,200:weak hero hierarchy][POINT:500,640:uneven spacing][POINT:850,40:low contrast nav][POINT:500,330:vague cta]"
+    [POINT:500,200:weak hero][POINT:500,500:flat typography][POINT:500,700:washed-out colors][POINT:500,850:indistinct pricing]"
 
     user asks "is it good now?" after applying your fixes, hero fixed but spacing still off:
     "the hero is way better — that headline finally leads the page. spacing is still uneven though, the gap above pricing is about half the others. one small prompt on your clipboard.
@@ -696,13 +743,29 @@ final class CompanionManager: ObservableObject {
     [/PROMPT]
     [POINT:500,660:uneven spacing]"
 
+    user says "fix it" after a review, with their project source files in the message:
+    "done — i rebuilt the hero headline and gave the nav real contrast. reload the page and ask me how it looks.
+    [EDIT:index.html]
+    <<<<<<< SEARCH
+        <h1 class="title">Welcome to our product</h1>
+    =======
+        <h1 class="hero-headline">Ship better pages, faster</h1>
+    >>>>>>> REPLACE
+    [EDIT:styles.css]
+    <<<<<<< SEARCH
+    .nav a { color: #b9bdc4; }
+    =======
+    .nav a { color: #374151; font-weight: 600; }
+    >>>>>>> REPLACE
+    [POINT:none]"
+
     user asks "is it good now?" and the page genuinely looks good:
     "yeah, this is solid now. the hierarchy reads top to bottom the way it should, spacing is consistent, and the cta finally pops. ship it. [POINT:none]"
 
     user asks a general question like "what font pairs well with inter?":
     "inter is a workhorse, so pair it with something that has more personality for headlines — newsreader or fraunces gives you that editorial contrast without clashing. [POINT:none]"
 
-    CRITICAL: every response must end with coordinate tags — one to four [POINT:x,y:label] tags back to back, or a single [POINT:none] — as the very last thing you write, AFTER the [/PROMPT] marker if you wrote a prompt block. the order is always: spoken critique, then the optional [PROMPT]...[/PROMPT] block, then the tags. if you open a [PROMPT] block you MUST close it with [/PROMPT] before the tags. never more than four tags, never mix [POINT:none] with coordinate tags, never write anything after the tags, and never skip them. the prompt block and the tags are stripped by software before your words are spoken aloud, so the user never hears them.
+    CRITICAL: every response must end with coordinate tags — one to four [POINT:x,y:label] tags back to back, or a single [POINT:none] — as the very last thing you write, AFTER the [/PROMPT] marker or the last >>>>>>> REPLACE line if you wrote blocks. the order is always: spoken critique, then the optional [PROMPT]...[/PROMPT] block OR [EDIT:...] blocks, then the tags. if you open a [PROMPT] block you MUST close it with [/PROMPT], and every [EDIT] block MUST end with its >>>>>>> REPLACE line, before the tags. never more than four tags, never mix [POINT:none] with coordinate tags, never write anything after the tags, and never skip them. the prompt block, the edit blocks, and the tags are all stripped by software before your words are spoken aloud, so the user never hears them.
     """
 
     // MARK: - AI Response Pipeline
@@ -742,14 +805,40 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
+                // When a project folder is configured, its source files ride
+                // along with every request so the model can ground its
+                // critique in the real markup and emit [EDIT:...] fixes when
+                // asked. Conversation history stores only the raw transcript,
+                // so the file payload never accumulates across turns. The
+                // gather runs off the main actor — walking the project tree
+                // would otherwise stall the spinner on every turn.
+                let projectFolderURLForRequest = webProjectFolderURL
+                let webProjectFiles = await Task.detached(priority: .userInitiated) {
+                    Self.gatherWebProjectFiles(projectFolderURL: projectFolderURLForRequest)
+                }.value
+
+                guard !Task.isCancelled else { return }
+                let projectFilesContextSection: String
+                if webProjectFiles.isEmpty {
+                    projectFilesContextSection = ""
+                } else {
+                    let projectFileSections = webProjectFiles.map { projectFile in
+                        "project file: \(projectFile.relativePath)\n```\n\(projectFile.contents)\n```"
+                    }
+                    projectFilesContextSection = "the user's web project source (\(webProjectFiles.count) file\(webProjectFiles.count == 1 ? "" : "s")):\n\n"
+                        + projectFileSections.joined(separator: "\n\n")
+                        + "\n\n"
+                }
+
                 // The model reliably follows the response format when reminded
                 // in the current turn, but tends to drop format scaffolding
-                // (the [PROMPT] block and [POINT:...] tags) when the instruction
-                // only lives in the system prompt. Conversation history stores
-                // the raw transcript, so this reminder never accumulates across
-                // turns.
-                let userPromptWithFormatReminder = transcript
-                    + "\n\n(format reminder: short spoken critique first; if the page needs work, include the full improvement prompt wrapped in [PROMPT]...[/PROMPT]; then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
+                // (the [PROMPT]/[EDIT] blocks and [POINT:...] tags) when the
+                // instruction only lives in the system prompt. Conversation
+                // history stores the raw transcript, so this reminder never
+                // accumulates across turns.
+                let userPromptWithFormatReminder = projectFilesContextSection
+                    + transcript
+                    + "\n\n(format reminder: short spoken critique first; if the page needs work, include the full improvement prompt wrapped in [PROMPT]...[/PROMPT] — but if the user asked you to APPLY the fixes and you have the project files, emit [EDIT:path] search/replace blocks instead; then end with one to four [POINT:x,y:label] tags or a single [POINT:none] as the very last thing — nothing after the tags)"
 
                 let (fullResponseText, _) = try await miniMaxAPI.analyzeImageStreaming(
                     images: labeledImages,
@@ -773,13 +862,45 @@ final class CompanionManager: ObservableObject {
                 let parseResult = Self.parseCompanionResponse(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Auto-copy the coding-agent prompt and show it next to the
-                // cursor with the "copied to clipboard" confirmation. This runs
-                // before TTS so the confirmation is on screen while the critique
-                // is spoken and the cursor tours the problem areas.
-                if let improvementPromptText = parseResult.improvementPromptText {
+                // Route to exactly ONE outcome — edits win over the prompt.
+                // The model is told never to emit both; if it does anyway,
+                // two pills back-to-back would hide the first and the
+                // clipboard would change without acknowledgment. This runs
+                // before TTS so the confirmation is on screen while the
+                // critique is spoken. The pill totals include blocks the
+                // parser dropped as malformed, so it never claims full
+                // success when part of the model's output was discarded.
+                let attemptedEditBlockCount = parseResult.codeEdits.count + parseResult.droppedEditBlockCount
+                if attemptedEditBlockCount > 0 {
+                    let editApplicationResult = applyCodeEditsToProjectFiles(parseResult.codeEdits)
+                    for failureSummary in editApplicationResult.failureSummaries {
+                        print("⚠️ Code edit failed: \(failureSummary)")
+                    }
+                    if parseResult.droppedEditBlockCount > 0 {
+                        print("⚠️ Dropped \(parseResult.droppedEditBlockCount) malformed edit block(s)")
+                    }
+                    let unappliedCount = attemptedEditBlockCount - editApplicationResult.appliedCount
+                    let confirmationMessage: String
+                    if editApplicationResult.appliedCount == 0 {
+                        confirmationMessage = "couldn't apply the fixes — ask again"
+                    } else if unappliedCount == 0 {
+                        let fixNoun = editApplicationResult.appliedCount == 1 ? "fix" : "fixes"
+                        confirmationMessage = "applied \(editApplicationResult.appliedCount) \(fixNoun) — reload the page"
+                    } else {
+                        confirmationMessage = "applied \(editApplicationResult.appliedCount) of \(attemptedEditBlockCount) fixes — see Xcode console"
+                    }
+                    improvementPromptOverlayManager.showConfirmation(message: confirmationMessage)
+                    ClickyAnalytics.trackCodeEditsApplied(
+                        appliedCount: editApplicationResult.appliedCount,
+                        failedCount: unappliedCount
+                    )
+                } else if let improvementPromptText = parseResult.improvementPromptText {
+                    // Auto-copy the coding-agent prompt and show a compact
+                    // "copied" confirmation. The prompt text itself is
+                    // deliberately not displayed (distracting) — the
+                    // clipboard is the artifact.
                     copyImprovementPromptToClipboard(improvementPromptText)
-                    improvementPromptOverlayManager.showImprovementPrompt(improvementPromptText)
+                    improvementPromptOverlayManager.showConfirmation(message: "prompt copied — paste into your coding agent")
                     ClickyAnalytics.trackImprovementPromptGenerated(improvementPrompt: improvementPromptText)
                 }
 
@@ -929,6 +1050,149 @@ final class CompanionManager: ObservableObject {
         pasteboard.setString(improvementPromptText, forType: .string)
     }
 
+    // MARK: - Web Project Files
+
+    /// One source file from the user's web project, sent to the model so it
+    /// can critique the markup and emit [EDIT:...] fixes against it.
+    struct WebProjectFile {
+        let relativePath: String
+        let contents: String
+    }
+
+    /// File extensions included when sending the project's source to the model.
+    nonisolated private static let includedWebProjectFileExtensions: Set<String> = [
+        "html", "htm", "css", "js", "mjs", "jsx", "tsx", "ts", "vue", "svelte"
+    ]
+    /// Directory names that never contain hand-written page source.
+    nonisolated private static let excludedWebProjectDirectoryNames: Set<String> = [
+        "node_modules", "dist", "build", "out", ".next", "vendor", ".git"
+    ]
+    nonisolated private static let maximumWebProjectFileCount = 24
+    nonisolated private static let maximumCharactersPerWebProjectFile = 48_000
+    nonisolated private static let maximumTotalWebProjectCharacters = 240_000
+    /// Files larger than this many bytes are never read at all — at that
+    /// size they're generated bundles, not hand-written page source.
+    nonisolated private static let maximumWebProjectFileBytes = 1_000_000
+    /// Appended to a file that had to be cut at the character cap, so the
+    /// model can see the file exists but is incomplete (the system prompt
+    /// tells it never to target text past this marker).
+    nonisolated static let webProjectFileTruncationMarker = "\n... [file truncated — the rest was too long to include]"
+
+    /// Reads the project folder's source files, shallowest paths first so the
+    /// entry page (index.html) lands early. Bounded by file-count and
+    /// character caps so a large project can't blow up the request; files
+    /// over the character cap are truncated with a visible marker rather
+    /// than silently omitted. nonisolated static so it can run OFF the main
+    /// actor via Task.detached — walking a project tree and reading files is
+    /// real work that would otherwise stall the UI on every push-to-talk turn.
+    nonisolated private static func gatherWebProjectFiles(projectFolderURL: URL?) -> [WebProjectFile] {
+        guard let projectFolderURL else { return [] }
+        let fileManager = FileManager.default
+        guard let directoryEnumerator = fileManager.enumerator(
+            at: projectFolderURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var candidateFileURLs: [URL] = []
+        while let enumeratedItem = directoryEnumerator.nextObject() as? URL {
+            let resourceValues = try? enumeratedItem.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey])
+            if resourceValues?.isDirectory == true {
+                // Prune excluded trees instead of filtering their contents —
+                // node_modules alone can hold 100k+ entries and enumerating
+                // them takes seconds.
+                if excludedWebProjectDirectoryNames.contains(enumeratedItem.lastPathComponent) {
+                    directoryEnumerator.skipDescendants()
+                }
+                continue
+            }
+            guard resourceValues?.isRegularFile == true,
+                  includedWebProjectFileExtensions.contains(enumeratedItem.pathExtension.lowercased()),
+                  (resourceValues?.fileSize ?? 0) <= maximumWebProjectFileBytes else {
+                continue
+            }
+            candidateFileURLs.append(enumeratedItem)
+        }
+
+        let sortedFileURLs = candidateFileURLs.sorted { firstURL, secondURL in
+            let firstDepth = firstURL.pathComponents.count
+            let secondDepth = secondURL.pathComponents.count
+            if firstDepth != secondDepth { return firstDepth < secondDepth }
+            return firstURL.path < secondURL.path
+        }
+
+        let projectFolderPath = projectFolderURL.standardizedFileURL.path
+        var gatheredFiles: [WebProjectFile] = []
+        var totalCharacterCount = 0
+        for fileURL in sortedFileURLs {
+            guard gatheredFiles.count < maximumWebProjectFileCount,
+                  totalCharacterCount < maximumTotalWebProjectCharacters else { break }
+            guard let fileContents = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+
+            var includedContents = fileContents
+            if includedContents.count > maximumCharactersPerWebProjectFile {
+                includedContents = String(includedContents.prefix(maximumCharactersPerWebProjectFile))
+                    + webProjectFileTruncationMarker
+            }
+
+            var relativePath = fileURL.standardizedFileURL.path
+            if relativePath.hasPrefix(projectFolderPath + "/") {
+                relativePath = String(relativePath.dropFirst(projectFolderPath.count + 1))
+            }
+            gatheredFiles.append(WebProjectFile(relativePath: relativePath, contents: includedContents))
+            totalCharacterCount += includedContents.count
+        }
+        return gatheredFiles
+    }
+
+    /// Applies the model's search/replace edits to files inside the configured
+    /// project folder. Returns how many applied plus a summary of each failure.
+    private func applyCodeEditsToProjectFiles(_ codeEdits: [ParsedCodeEdit]) -> (appliedCount: Int, failureSummaries: [String]) {
+        guard let projectFolderURL = webProjectFolderURL else {
+            return (0, ["no project folder is configured"])
+        }
+        let projectFolderPath = projectFolderURL.standardizedFileURL.path
+        var appliedCount = 0
+        var failureSummaries: [String] = []
+
+        for codeEdit in codeEdits {
+            let targetFileURL = projectFolderURL
+                .appendingPathComponent(codeEdit.relativeFilePath)
+                .standardizedFileURL
+            // Containment guard: the resolved path must stay inside the
+            // project folder so a path like "../../something" can't escape it.
+            guard targetFileURL.path.hasPrefix(projectFolderPath + "/") else {
+                failureSummaries.append("\(codeEdit.relativeFilePath): path escapes the project folder")
+                continue
+            }
+            guard let originalContents = try? String(contentsOf: targetFileURL, encoding: .utf8) else {
+                failureSummaries.append("\(codeEdit.relativeFilePath): could not read file")
+                continue
+            }
+            // The search text always uses bare-LF lines (the response is
+            // normalized before parsing). For a CRLF file, fall back to
+            // matching against a normalized copy — the write then converts
+            // the file to LF, an acceptable trade for the edit applying.
+            var contentsToEdit = originalContents
+            if originalContents.range(of: codeEdit.searchText) == nil, originalContents.contains("\r\n") {
+                contentsToEdit = originalContents.replacingOccurrences(of: "\r\n", with: "\n")
+            }
+            guard let searchTextRange = contentsToEdit.range(of: codeEdit.searchText) else {
+                failureSummaries.append("\(codeEdit.relativeFilePath): search text not found")
+                continue
+            }
+            var updatedContents = contentsToEdit
+            updatedContents.replaceSubrange(searchTextRange, with: codeEdit.replacementText)
+            do {
+                try updatedContents.write(to: targetFileURL, atomically: true, encoding: .utf8)
+                appliedCount += 1
+            } catch {
+                failureSummaries.append("\(codeEdit.relativeFilePath): write failed — \(error.localizedDescription)")
+            }
+        }
+        return (appliedCount, failureSummaries)
+    }
+
     // MARK: - Point Tag Parsing
 
     /// A single parsed [POINT:x,y:label(:screenN)] coordinate tag.
@@ -1023,31 +1287,198 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Companion Response Parsing
 
-    /// Result of splitting the model's response into its three parts: spoken
-    /// critique, optional coding-agent improvement prompt, and pointing tags.
+    /// Result of splitting the model's response into its parts: spoken
+    /// critique, optional coding-agent improvement prompt, optional code
+    /// edits, and pointing tags.
     struct CompanionResponseParseResult {
-        /// The critique with the [PROMPT] block and every [POINT:...] tag
-        /// removed — this is what gets spoken via TTS.
+        /// The critique with the [PROMPT] block, [EDIT:...] blocks, and every
+        /// [POINT:...] tag removed — this is what gets spoken via TTS.
         let spokenText: String
         /// The improvement prompt body (without the [PROMPT]/[/PROMPT]
         /// markers), or nil when the model omitted the block — for example a
         /// re-review turn where the page is good, or a general question.
         let improvementPromptText: String?
+        /// Search/replace edits the model wants applied to the project files
+        /// (only emitted when the user asked Clicky to apply fixes).
+        let codeEdits: [ParsedCodeEdit]
+        /// Edit blocks the model emitted that were malformed/invalid and
+        /// dropped — the pill must not claim full success when this is > 0.
+        let droppedEditBlockCount: Int
         /// Pointing tour stops, same semantics as PointingParseResult.points.
         let points: [ParsedPointTag]
+    }
+
+    /// One search/replace edit the model wants applied to a project file.
+    struct ParsedCodeEdit {
+        let relativeFilePath: String
+        /// Text copied verbatim from the file — replaced at its first match.
+        let searchText: String
+        let replacementText: String
+    }
+
+    private static let codeEditOpeningMarkerPrefix = "[EDIT:"
+    private static let codeEditSearchMarker = "<<<<<<< SEARCH"
+    /// The divider and closer must sit on their own lines, so they are
+    /// matched with surrounding newlines — a literal "=======" inside an
+    /// expression can't terminate the search text early.
+    private static let codeEditDividerMarker = "\n=======\n"
+    private static let codeEditClosingMarker = "\n>>>>>>> REPLACE"
+
+    /// Result of extracting [EDIT:...] blocks from the model's response.
+    struct CodeEditExtractionResult {
+        let responseTextWithoutEditBlocks: String
+        let codeEdits: [ParsedCodeEdit]
+        /// Blocks that looked like real edit blocks but were malformed or
+        /// invalid and got dropped. Surfaced so the confirmation pill never
+        /// claims full success when part of the model's output was discarded.
+        let droppedEditBlockCount: Int
+    }
+
+    /// Extracts every [EDIT:path] search/replace block from the model's
+    /// response. Code inside the blocks can contain anything (including
+    /// bracket-heavy text), so this runs before point-tag parsing and the
+    /// blocks never reach TTS. Safety properties:
+    /// - An opener only counts when "[EDIT:" starts a line AND its "]" closes
+    ///   on that same line — a conversational mention of "[EDIT:" in prose
+    ///   can't hijack parsing.
+    /// - All marker searches are bounded at the next block's opener, so a
+    ///   malformed block can never borrow markers from the following block;
+    ///   it drops only itself and parsing continues.
+    /// - Edits whose content still contains conflict-style marker lines
+    ///   ("<<<<<<< " / ">>>>>>> ") are rejected — those only appear when a
+    ///   marker collision corrupted the block (e.g. the user's file contains
+    ///   unresolved git conflict markers).
+    /// The safe failure mode is always "no edit", never "spoken code" or a
+    /// corrupted write.
+    static func extractCodeEditBlocks(from responseText: String) -> CodeEditExtractionResult {
+        var remainingText = responseText
+        var codeEdits: [ParsedCodeEdit] = []
+        var droppedEditBlockCount = 0
+
+        let closingMarkerWithoutLeadingNewline = String(codeEditClosingMarker.dropFirst())
+
+        /// Finds the next line-anchored "[EDIT:" whose "]" sits on the same
+        /// line, searching from the given index. Prose mentions are skipped.
+        func findNextRealOpeningMarker(from searchStartIndex: String.Index) -> (markerRange: Range<String.Index>, pathRange: Range<String.Index>)? {
+            var cursorIndex = searchStartIndex
+            while let candidateRange = remainingText.range(of: codeEditOpeningMarkerPrefix, range: cursorIndex..<remainingText.endIndex) {
+                let isAtLineStart = candidateRange.lowerBound == remainingText.startIndex
+                    || remainingText[remainingText.index(before: candidateRange.lowerBound)] == "\n"
+                if isAtLineStart,
+                   let closingBracketRange = remainingText.range(of: "]", range: candidateRange.upperBound..<remainingText.endIndex),
+                   !remainingText[candidateRange.upperBound..<closingBracketRange.lowerBound].contains("\n") {
+                    return (candidateRange, candidateRange.upperBound..<closingBracketRange.lowerBound)
+                }
+                cursorIndex = candidateRange.upperBound
+            }
+            return nil
+        }
+
+        /// A contaminated search/replacement (marker collision) contains a
+        /// line starting with a conflict-style marker.
+        func containsConflictMarkerLine(_ text: String) -> Bool {
+            text.split(separator: "\n", omittingEmptySubsequences: false).contains { line in
+                line.hasPrefix("<<<<<<< ") || line.hasPrefix(">>>>>>> ")
+            }
+        }
+
+        while let openingMarker = findNextRealOpeningMarker(from: remainingText.startIndex) {
+            // This block's scope ends where the next block begins — markers
+            // can never be borrowed across block boundaries.
+            let pathClosingBracketEnd = remainingText.index(after: openingMarker.pathRange.upperBound)
+            let blockScopeEnd: String.Index
+            if let nextOpeningMarker = findNextRealOpeningMarker(from: pathClosingBracketEnd) {
+                blockScopeEnd = nextOpeningMarker.markerRange.lowerBound
+            } else {
+                blockScopeEnd = remainingText.endIndex
+            }
+
+            /// Resolves the block's end within its scope: a closing marker on
+            /// its own line, or — for a deletion edit with an EMPTY
+            /// replacement — the closing marker directly after the divider,
+            /// where the divider's trailing newline doubles as the closer's
+            /// leading newline. The empty-replacement check runs FIRST so a
+            /// deletion block can never borrow a later block's closer.
+            func resolveBlockEnd(after dividerMarkerRange: Range<String.Index>) -> (replacementText: String, blockEndIndex: String.Index)? {
+                if remainingText[dividerMarkerRange.upperBound..<blockScopeEnd].hasPrefix(closingMarkerWithoutLeadingNewline) {
+                    return (
+                        "",
+                        remainingText.index(dividerMarkerRange.upperBound, offsetBy: closingMarkerWithoutLeadingNewline.count)
+                    )
+                }
+                if let closingMarkerRange = remainingText.range(of: codeEditClosingMarker, range: dividerMarkerRange.upperBound..<blockScopeEnd) {
+                    return (
+                        String(remainingText[dividerMarkerRange.upperBound..<closingMarkerRange.lowerBound]),
+                        closingMarkerRange.upperBound
+                    )
+                }
+                return nil
+            }
+
+            guard let searchMarkerRange = remainingText.range(of: codeEditSearchMarker, range: pathClosingBracketEnd..<blockScopeEnd),
+                  let dividerMarkerRange = remainingText.range(of: codeEditDividerMarker, range: searchMarkerRange.upperBound..<blockScopeEnd),
+                  let blockEnd = resolveBlockEnd(after: dividerMarkerRange)
+            else {
+                // Malformed/truncated block: drop ONLY this block — up to the
+                // next block's opener, or the next [POINT: tag / end of text
+                // when this is the last block — and keep parsing.
+                droppedEditBlockCount += 1
+                var malformedBlockEnd = blockScopeEnd
+                if blockScopeEnd == remainingText.endIndex,
+                   let nextPointTagRange = remainingText.range(of: "[POINT:", range: pathClosingBracketEnd..<remainingText.endIndex) {
+                    malformedBlockEnd = nextPointTagRange.lowerBound
+                }
+                remainingText.removeSubrange(openingMarker.markerRange.lowerBound..<malformedBlockEnd)
+                continue
+            }
+
+            let relativeFilePath = String(remainingText[openingMarker.pathRange])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // The search text starts on the line after the SEARCH marker.
+            var searchText = String(remainingText[searchMarkerRange.upperBound..<dividerMarkerRange.lowerBound])
+            if searchText.hasPrefix("\n") { searchText.removeFirst() }
+
+            let isValidEdit = !relativeFilePath.isEmpty
+                && !searchText.isEmpty
+                && !containsConflictMarkerLine(searchText)
+                && !containsConflictMarkerLine(blockEnd.replacementText)
+            if isValidEdit {
+                codeEdits.append(ParsedCodeEdit(
+                    relativeFilePath: relativeFilePath,
+                    searchText: searchText,
+                    replacementText: blockEnd.replacementText
+                ))
+            } else {
+                droppedEditBlockCount += 1
+            }
+            remainingText.removeSubrange(openingMarker.markerRange.lowerBound..<blockEnd.blockEndIndex)
+        }
+
+        return CodeEditExtractionResult(
+            responseTextWithoutEditBlocks: remainingText,
+            codeEdits: codeEdits,
+            droppedEditBlockCount: droppedEditBlockCount
+        )
     }
 
     private static let improvementPromptOpeningMarker = "[PROMPT]"
     private static let improvementPromptClosingMarker = "[/PROMPT]"
 
     /// Splits the model's raw response into the spoken critique, the optional
-    /// [PROMPT]...[/PROMPT] improvement prompt, and the [POINT:...] tags.
-    /// The prompt block is extracted FIRST so coordinate-like text inside it
-    /// can never trigger a pointing tour; the existing point-tag parser then
-    /// runs on the remainder. parsePointingCoordinates itself is untouched
-    /// because the onboarding demo also calls it.
+    /// [PROMPT]...[/PROMPT] improvement prompt, the optional [EDIT:...] code
+    /// edits, and the [POINT:...] tags. Extraction order is load-bearing:
+    /// the PROMPT block comes out FIRST so an edit block the model wrongly
+    /// writes inside it stays clipboard text and is never executed against
+    /// the user's files; edit blocks come out of the remainder next so code
+    /// can never reach TTS or trigger phantom pointing; the point-tag parser
+    /// runs last. parsePointingCoordinates itself is untouched because the
+    /// onboarding demo also calls it.
     static func parseCompanionResponse(from responseText: String) -> CompanionResponseParseResult {
-        var remainingResponseText = responseText
+        // Normalize CRLF up front — the edit-block markers and the spoken
+        // text all assume bare-LF lines, and a CRLF-emitting model would
+        // otherwise have every block dropped as malformed.
+        var remainingResponseText = responseText.replacingOccurrences(of: "\r\n", with: "\n")
         var improvementPromptText: String? = nil
 
         if let openingMarkerRange = remainingResponseText.range(of: improvementPromptOpeningMarker) {
@@ -1083,14 +1514,20 @@ final class CompanionManager: ObservableObject {
         let trimmedImprovementPromptText = improvementPromptText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let pointingParseResult = parsePointingCoordinates(from: remainingResponseText)
+        // Edit blocks come out of the post-prompt remainder, so a block
+        // nested inside [PROMPT] is clipboard text, never an applied edit.
+        let codeEditExtractionResult = extractCodeEditBlocks(from: remainingResponseText)
+
+        let pointingParseResult = parsePointingCoordinates(from: codeEditExtractionResult.responseTextWithoutEditBlocks)
 
         return CompanionResponseParseResult(
-            // Trim again here: removing the prompt block can leave whitespace
+            // Trim again here: removing the blocks can leave whitespace
             // behind, and parsePointingCoordinates returns its input untrimmed
             // when the response contains no tags.
             spokenText: pointingParseResult.spokenText.trimmingCharacters(in: .whitespacesAndNewlines),
             improvementPromptText: (trimmedImprovementPromptText?.isEmpty == false) ? trimmedImprovementPromptText : nil,
+            codeEdits: codeEditExtractionResult.codeEdits,
+            droppedEditBlockCount: codeEditExtractionResult.droppedEditBlockCount,
             points: pointingParseResult.points
         )
     }

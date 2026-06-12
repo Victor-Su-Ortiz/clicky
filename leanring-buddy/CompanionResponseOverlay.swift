@@ -2,12 +2,11 @@
 //  CompanionResponseOverlay.swift
 //  leanring-buddy
 //
-//  Panel that displays the coding-agent improvement prompt next to the mouse
-//  cursor, with a "copied to clipboard" confirmation footer. Uses a
-//  non-activating NSPanel so it floats above all apps without stealing focus.
-//  The panel is positioned once at show time — it deliberately does not follow
-//  the mouse, so the prompt stays readable while the user moves the mouse to
-//  look at the problem areas the blue cursor points at.
+//  Compact confirmation that appears next to the mouse cursor when an
+//  improvement prompt has been auto-copied to the clipboard. The full prompt
+//  is deliberately NOT displayed — it lives on the clipboard, and showing it
+//  on screen proved distracting. Uses a non-activating NSPanel so it floats
+//  above all apps without stealing focus, positioned once at show time.
 //
 
 import AppKit
@@ -18,8 +17,8 @@ import SwiftUI
 
 @MainActor
 final class CompanionResponseOverlayViewModel: ObservableObject {
-    @Published var improvementPromptText: String = ""
-    @Published var isShowingPrompt: Bool = false
+    @Published var isShowingConfirmation: Bool = false
+    @Published var confirmationMessage: String = ""
 }
 
 // MARK: - Overlay Manager
@@ -35,61 +34,48 @@ final class CompanionResponseOverlayManager {
     /// The vertical offset from the cursor downward to the top edge of the overlay panel.
     private let cursorOffsetY: CGFloat = 6
     /// Maximum width of the overlay panel.
-    private let overlayMaxWidth: CGFloat = 420
+    private let overlayMaxWidth: CGFloat = 320
+    /// How long the confirmation stays up. Short and fixed — it carries one
+    /// line of information. Also hidden when the next push-to-talk begins.
+    private let confirmationAutoHideDelaySeconds: TimeInterval = 8
 
-    /// Shows the improvement prompt near the current mouse location and
-    /// schedules an auto-hide based on estimated reading time. The prompt
-    /// arrives complete (the pipeline receives the full response before
-    /// display), so nothing streams.
-    func showImprovementPrompt(_ improvementPromptText: String) {
+    /// Shows a one-line confirmation (e.g. "prompt copied" or "applied N
+    /// fixes") near the current mouse location and schedules its auto-hide.
+    func showConfirmation(message: String) {
         autoHideWorkItem?.cancel()
         autoHideWorkItem = nil
 
-        overlayViewModel.improvementPromptText = improvementPromptText
-        overlayViewModel.isShowingPrompt = true
+        overlayViewModel.confirmationMessage = message
+        overlayViewModel.isShowingConfirmation = true
         createOverlayPanelIfNeeded()
 
-        // Give SwiftUI one runloop tick to lay out the new text before
-        // measuring — fittingSize would otherwise report the previous
-        // content's size. The panel is only ordered front after sizing and
-        // positioning so the user never sees it jump.
+        // Give SwiftUI one runloop tick to lay out before measuring —
+        // fittingSize would otherwise report the previous content's size.
+        // The panel is only ordered front after sizing and positioning so
+        // the user never sees it jump.
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.overlayViewModel.isShowingPrompt else { return }
+            guard let self, self.overlayViewModel.isShowingConfirmation else { return }
             self.resizePanelToFitContent()
             self.positionPanelNearCursor()
             self.overlayPanel?.alphaValue = 1
             self.overlayPanel?.orderFrontRegardless()
         }
 
-        scheduleAutoHideAfterEstimatedReadingTime(for: improvementPromptText)
+        let hideWork = DispatchWorkItem { [weak self] in
+            self?.fadeOutAndHide()
+        }
+        autoHideWorkItem = hideWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + confirmationAutoHideDelaySeconds, execute: hideWork)
     }
 
     func hideOverlay() {
         autoHideWorkItem?.cancel()
         autoHideWorkItem = nil
-        overlayViewModel.isShowingPrompt = false
-        overlayViewModel.improvementPromptText = ""
+        overlayViewModel.isShowingConfirmation = false
         overlayPanel?.orderOut(nil)
     }
 
     // MARK: - Private
-
-    /// Fades the panel out after the user has had time to skim the prompt.
-    private func scheduleAutoHideAfterEstimatedReadingTime(for improvementPromptText: String) {
-        let promptWordCount = improvementPromptText.split(whereSeparator: { $0.isWhitespace }).count
-        // ~200 words-per-minute skim speed, clamped so short prompts stay up
-        // long enough to register and long ones don't squat on screen. The
-        // full text is already on the clipboard, so the panel is a preview,
-        // not the artifact. The panel is also hidden the moment the next
-        // push-to-talk interaction begins.
-        let autoHideDelaySeconds = min(45.0, max(12.0, Double(promptWordCount) * 0.3))
-
-        let hideWork = DispatchWorkItem { [weak self] in
-            self?.fadeOutAndHide()
-        }
-        autoHideWorkItem = hideWork
-        DispatchQueue.main.asyncAfter(deadline: .now() + autoHideDelaySeconds, execute: hideWork)
-    }
 
     private func createOverlayPanelIfNeeded() {
         if overlayPanel != nil { return }
@@ -193,37 +179,18 @@ private struct CompanionResponseOverlayView: View {
     @ObservedObject var viewModel: CompanionResponseOverlayViewModel
 
     var body: some View {
-        if viewModel.isShowingPrompt {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("prompt for your coding agent")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
-
-                Text(viewModel.improvementPromptText)
-                    .font(.system(size: 12, weight: .regular))
+        if viewModel.isShowingConfirmation {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.success)
+                Text(viewModel.confirmationMessage)
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundColor(DS.Colors.textPrimary)
-                    .lineSpacing(3)
-                    // Backstop against a pathologically long prompt growing the
-                    // panel taller than the screen — the clipboard always holds
-                    // the full text.
-                    .lineLimit(30)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: 396, alignment: .leading)
-
-                Rectangle()
-                    .fill(DS.Colors.borderSubtle.opacity(0.5))
-                    .frame(height: 1)
-
-                HStack(spacing: 5) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 11))
-                    Text("copied to clipboard — paste into your coding agent")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .foregroundColor(DS.Colors.success)
+                    .fixedSize()
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(DS.Colors.surface1.opacity(0.95))

@@ -11,6 +11,12 @@
  *                 request body and SSE stream both ways, so the app always
  *                 speaks Anthropic Messages format regardless of upstream)
  *   POST /tts   → MiniMax text-to-speech API (t2a_v2)
+ *   POST /stt   → NVIDIA Parakeet speech-to-text on Together AI — the app
+ *                 sends a raw 16kHz mono WAV body and gets back {"text": ...}
+ *   GET  /stt-stream → websocket relay to Together's realtime transcription
+ *                 endpoint (Parakeet). The relay exists because the realtime
+ *                 endpoint authenticates via an Authorization header, which a
+ *                 client websocket can't set without shipping the key.
  */
 
 interface Env {
@@ -34,9 +40,25 @@ interface Env {
 
 const DEFAULT_TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7";
 
+const TOGETHER_STT_MODEL = "nvidia/parakeet-tdt-0.6b-v3";
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // Websocket upgrades are GET requests, so this route must be handled
+    // before the POST-only guard below.
+    if (url.pathname === "/stt-stream") {
+      try {
+        return await handleSTTStream(request, env);
+      } catch (error) {
+        console.error(`[/stt-stream] Unhandled error:`, error);
+        return new Response(
+          JSON.stringify({ error: String(error) }),
+          { status: 500, headers: { "content-type": "application/json" } }
+        );
+      }
+    }
 
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
@@ -49,6 +71,10 @@ export default {
 
       if (url.pathname === "/tts") {
         return await handleTTS(request, env);
+      }
+
+      if (url.pathname === "/stt") {
+        return await handleSTT(request, env);
       }
 
       if (url.pathname === "/transcribe-token") {
@@ -490,6 +516,134 @@ export function createOpenAIToAnthropicSSETransform(): TransformStream<Uint8Arra
       }
       emitDone(controller);
     },
+  });
+}
+
+/**
+ * Relays a websocket to Together's realtime transcription endpoint with the
+ * API key injected. Messages pass through untouched in both directions —
+ * the app speaks Together's realtime protocol directly (append/commit in,
+ * transcription delta/completed events out).
+ */
+async function handleSTTStream(request: Request, env: Env): Promise<Response> {
+  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    return new Response("Expected a websocket upgrade", { status: 426 });
+  }
+  if (!env.TOGETHER_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "The /stt-stream route needs the TOGETHER_API_KEY secret — run: npx wrangler secret put TOGETHER_API_KEY" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  // Outbound websockets from a Worker use fetch with an Upgrade header —
+  // this is also the only way to attach the Authorization header, which is
+  // the entire reason this relay exists. Connect upstream FIRST so a
+  // failure surfaces as a clean HTTP error instead of a dead client socket.
+  const upstreamResponse = await fetch(
+    `https://api.together.ai/v1/realtime?model=${encodeURIComponent(TOGETHER_STT_MODEL)}&input_audio_format=pcm_s16le_16000`,
+    {
+      headers: {
+        Upgrade: "websocket",
+        Authorization: `Bearer ${env.TOGETHER_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
+
+  const upstreamSocket = upstreamResponse.webSocket;
+  if (!upstreamSocket) {
+    const errorBody = await upstreamResponse.text();
+    console.error(`[/stt-stream] Together realtime refused upgrade ${upstreamResponse.status}: ${errorBody}`);
+    return new Response(errorBody || "Upstream websocket upgrade failed", {
+      status: upstreamResponse.status === 101 ? 502 : upstreamResponse.status,
+    });
+  }
+  upstreamSocket.accept();
+
+  const webSocketPair = new WebSocketPair();
+  const clientSocket = webSocketPair[0];
+  const serverSocket = webSocketPair[1];
+  serverSocket.accept();
+
+  /// Closing with an invalid/reserved code throws in the Workers runtime,
+  /// so closes fall back to a plain 1000 when passthrough fails.
+  const safeClose = (socket: WebSocket, code?: number, reason?: string) => {
+    try {
+      socket.close(code, reason?.slice(0, 120));
+    } catch {
+      try { socket.close(1000); } catch {}
+    }
+  };
+
+  serverSocket.addEventListener("message", (event) => {
+    try { upstreamSocket.send(event.data); } catch {}
+  });
+  upstreamSocket.addEventListener("message", (event) => {
+    try { serverSocket.send(event.data); } catch {}
+  });
+  serverSocket.addEventListener("close", (event) => safeClose(upstreamSocket, event.code, event.reason));
+  upstreamSocket.addEventListener("close", (event) => safeClose(serverSocket, event.code, event.reason));
+  serverSocket.addEventListener("error", () => safeClose(upstreamSocket, 1011, "client error"));
+  upstreamSocket.addEventListener("error", () => safeClose(serverSocket, 1011, "upstream error"));
+
+  return new Response(null, { status: 101, webSocket: clientSocket });
+}
+
+/**
+ * Transcribes push-to-talk audio with NVIDIA Parakeet on Together AI. The
+ * app sends the raw WAV bytes; the model and request shape live here (like
+ * /tts owns the voice settings) so they can change without an app update.
+ */
+async function handleSTT(request: Request, env: Env): Promise<Response> {
+  if (!env.TOGETHER_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "The /stt route needs the TOGETHER_API_KEY secret — run: npx wrangler secret put TOGETHER_API_KEY" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const audioWAVBuffer = await request.arrayBuffer();
+  if (audioWAVBuffer.byteLength === 0) {
+    return new Response(
+      JSON.stringify({ error: "Missing WAV audio in request body" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const togetherFormData = new FormData();
+  togetherFormData.append("model", TOGETHER_STT_MODEL);
+  togetherFormData.append("language", "en");
+  togetherFormData.append("response_format", "json");
+  togetherFormData.append(
+    "file",
+    new Blob([audioWAVBuffer], { type: "audio/wav" }),
+    "voice-input.wav"
+  );
+
+  // fetch sets the multipart boundary header itself from the FormData body.
+  const response = await fetch("https://api.together.xyz/v1/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.TOGETHER_API_KEY}`,
+    },
+    body: togetherFormData,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/stt] Together transcription error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Together returns OpenAI-shaped JSON ({"text": "..."}); pass it through.
+  const transcriptionBody = await response.text();
+  return new Response(transcriptionBody, {
+    status: 200,
+    headers: { "content-type": "application/json" },
   });
 }
 

@@ -793,20 +793,28 @@ struct BlueCursorView: View {
 
 // MARK: - Blue Cursor Waveform
 
-/// A small blue waveform that replaces the triangle cursor while
-/// the user is holding the push-to-talk shortcut and speaking.
+/// A small waveform that replaces the cursor while the user is holding the
+/// push-to-talk shortcut and speaking. Bars sweep through the pink→orange
+/// gradient of the clicky-cursor artwork so the audio visuals match it.
 private struct BlueCursorWaveformView: View {
     let audioPowerLevel: CGFloat
 
     private let barCount = 5
     private let listeningBarProfile: [CGFloat] = [0.4, 0.7, 1.0, 0.7, 0.4]
 
+    /// Gradient endpoints as raw sRGB components (#EE2C90 → #FF5E1B, sampled
+    /// from the clicky-cursor artwork). Kept as components because each bar
+    /// gets an interpolated solid color — SwiftUI's Color can't be lerped
+    /// directly on this deployment target.
+    private let gradientStartComponents: (red: Double, green: Double, blue: Double) = (0xEE / 255.0, 0x2C / 255.0, 0x90 / 255.0)
+    private let gradientEndComponents: (red: Double, green: Double, blue: Double) = (0xFF / 255.0, 0x5E / 255.0, 0x1B / 255.0)
+
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 36.0)) { timelineContext in
             HStack(alignment: .center, spacing: 2) {
                 ForEach(0..<barCount, id: \.self) { barIndex in
                     RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(DS.Colors.overlayCursorBlue)
+                        .fill(barFillColor(for: barIndex))
                         .frame(
                             width: 2,
                             height: barHeight(
@@ -816,9 +824,20 @@ private struct BlueCursorWaveformView: View {
                         )
                 }
             }
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: DS.Colors.clickyBrandPink.opacity(0.6), radius: 6, x: 0, y: 0)
             .animation(.linear(duration: 0.08), value: audioPowerLevel)
         }
+    }
+
+    /// Solid color for one bar, interpolated left-to-right across the
+    /// pink→orange gradient so the bar row reads as one gradient sweep.
+    private func barFillColor(for barIndex: Int) -> Color {
+        let gradientFraction = Double(barIndex) / Double(barCount - 1)
+        return Color(
+            red: gradientStartComponents.red + (gradientEndComponents.red - gradientStartComponents.red) * gradientFraction,
+            green: gradientStartComponents.green + (gradientEndComponents.green - gradientStartComponents.green) * gradientFraction,
+            blue: gradientStartComponents.blue + (gradientEndComponents.blue - gradientStartComponents.blue) * gradientFraction
+        )
     }
 
     private func barHeight(for barIndex: Int, timelineDate: Date) -> CGFloat {
@@ -833,8 +852,9 @@ private struct BlueCursorWaveformView: View {
 
 // MARK: - Blue Cursor Spinner
 
-/// A small blue spinning indicator that replaces the triangle cursor
-/// while the AI is processing a voice input.
+/// A small spinning indicator that replaces the cursor while the AI is
+/// processing a voice input. Sweeps through the pink→orange gradient of
+/// the clicky-cursor artwork so the audio visuals match it.
 private struct BlueCursorSpinnerView: View {
     @State private var isSpinning = false
 
@@ -844,8 +864,9 @@ private struct BlueCursorSpinnerView: View {
             .stroke(
                 AngularGradient(
                     colors: [
-                        DS.Colors.overlayCursorBlue.opacity(0.0),
-                        DS.Colors.overlayCursorBlue
+                        DS.Colors.clickyBrandPink.opacity(0.0),
+                        DS.Colors.clickyBrandPink,
+                        DS.Colors.clickyBrandOrange
                     ],
                     center: .center
                 ),
@@ -853,7 +874,7 @@ private struct BlueCursorSpinnerView: View {
             )
             .frame(width: 14, height: 14)
             .rotationEffect(.degrees(isSpinning ? 360 : 0))
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: DS.Colors.clickyBrandPink.opacity(0.6), radius: 6, x: 0, y: 0)
             .onAppear {
                 withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
                     isSpinning = true

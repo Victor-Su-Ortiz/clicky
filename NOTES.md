@@ -1,8 +1,14 @@
-# Status notes — 2026-06-10
+# Status notes — 2026-06-10 (updated 2026-06-12)
+
+## ✅ Worker deployed (2026-06-12) — STT is live
+
+Speech-to-text defaults to **NVIDIA Parakeet on Together AI** (`VoiceTranscriptionProvider = "parakeet"` in Info.plist). The Worker is deployed with the `TOGETHER_API_KEY` secret set, and all routes were verified live: `/stt-stream` (websocket streaming, ~280 ms release→transcript), `/stt` (upload fallback), `/transcribe-token` and `/chat` (regression-checked, unchanged). Just rebuild the app in Xcode.
+
+(To revert STT: set `VoiceTranscriptionProvider` back to `assemblyai` in `leanring-buddy/Info.plist` and rebuild — the AssemblyAI route is still live.)
 
 ## Which chat API is Clicky using?
 
-**MiniMax, unchanged.** The live Cloudflare Worker (`clicky-proxy.minimax-together.workers.dev`) is still the original MiniMax-only version — the Together AI work below has NOT been deployed.
+**MiniMax, unchanged.** The Together AI **chat** upstream is still dormant (`CHAT_UPSTREAM = "minimax"`) — deploying the Worker for STT does not change the chat behavior at all.
 
 ## Together AI support (built, dormant, not deployed)
 

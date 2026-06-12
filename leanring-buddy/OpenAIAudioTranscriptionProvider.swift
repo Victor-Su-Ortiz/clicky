@@ -132,7 +132,12 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
     }
 
     func cancel() {
-        stateQueue.async {
+        // [weak self] is load-bearing: cancel() is also called from deinit,
+        // and a strong capture there would outlive deallocation — the block
+        // would later write into freed memory (use-after-free). With weak,
+        // the deinit-time block resolves nil and no-ops.
+        stateQueue.async { [weak self] in
+            guard let self else { return }
             self.isCancelled = true
             self.bufferedPCM16AudioData.removeAll(keepingCapacity: false)
         }

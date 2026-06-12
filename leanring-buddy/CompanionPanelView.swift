@@ -31,6 +31,9 @@ struct CompanionPanelView: View {
 
                 modelRow
                     .padding(.horizontal, 16)
+
+                projectFolderRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -614,6 +617,67 @@ struct CompanionPanelView: View {
                 .foregroundColor(DS.Colors.textTertiary)
         }
         .padding(.vertical, 4)
+    }
+
+    // MARK: - Project Folder Row
+
+    /// Lets the user pick the web project folder Clicky reads source files
+    /// from and edits when they ask it to apply fixes ("fix it"). Without a
+    /// folder, Clicky can still critique and copy prompts — it just can't
+    /// edit code.
+    private var projectFolderRow: some View {
+        HStack {
+            Text("Project folder")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            Button(action: { chooseProjectFolder() }) {
+                Text(companionManager.webProjectFolderURL?.lastPathComponent ?? "Choose…")
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 140)
+                    .foregroundColor(companionManager.webProjectFolderURL == nil ? DS.Colors.textOnAccent : DS.Colors.textSecondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(companionManager.webProjectFolderURL == nil ? DS.Colors.accent : DS.Colors.surface3)
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+
+            if companionManager.webProjectFolderURL != nil {
+                Button(action: { companionManager.setWebProjectFolder(nil) }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+                .help("Clear the project folder")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Opens a folder picker for the web project. The menu bar panel is
+    /// non-activating, so the app must be activated first or the open panel
+    /// appears behind other windows.
+    private func chooseProjectFolder() {
+        let folderOpenPanel = NSOpenPanel()
+        folderOpenPanel.canChooseDirectories = true
+        folderOpenPanel.canChooseFiles = false
+        folderOpenPanel.allowsMultipleSelection = false
+        folderOpenPanel.message = "Choose the web project folder Clicky can read and edit"
+        folderOpenPanel.prompt = "Use This Folder"
+        NSApp.activate(ignoringOtherApps: true)
+        if folderOpenPanel.runModal() == .OK, let selectedFolderURL = folderOpenPanel.url {
+            companionManager.setWebProjectFolder(selectedFolderURL)
+        }
     }
 
     // MARK: - DM Farza Button
