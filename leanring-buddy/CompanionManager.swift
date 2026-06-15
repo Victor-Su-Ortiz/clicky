@@ -1275,58 +1275,61 @@ final class CompanionManager: ObservableObject {
     /// text. Every tag is stripped from the spoken text; [POINT:none] tags
     /// contribute no points.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
-        // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
-        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]"#
+        // Extract coordinate tags: [POINT:123,456:label] or
+        // [POINT:123,456:label:screen2]. Case-insensitive and whitespace-
+        // tolerant so a casing/spacing drift on the keyword (M3 via Together
+        // occasionally writes [Point: 500, 200 : label]) still resolves to a
+        // pointing stop. [POINT:none] carries no coordinates and contributes
+        // nothing here — it is only stripped from the spoken text below.
+        let coordinatePattern = #"\[\s*POINT\s*:\s*(\d+)\s*,\s*(\d+)(?:\s*:\s*([^\]:]+?))?(?:\s*:\s*screen\s*(\d+))?\s*\]"#
 
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-            return PointingParseResult(spokenText: responseText, points: [])
-        }
-
-        let fullTextRange = NSRange(responseText.startIndex..., in: responseText)
-        let allTagMatches = regex.matches(in: responseText, range: fullTextRange)
-        guard !allTagMatches.isEmpty else {
-            // No tag found at all
-            return PointingParseResult(spokenText: responseText, points: [])
-        }
-
-        // Remove every tag occurrence from the spoken text. Removing from the
-        // last match backwards keeps the earlier match ranges valid.
-        var spokenTextWithTagsRemoved = responseText
-        for tagMatch in allTagMatches.reversed() {
-            if let tagRange = Range(tagMatch.range, in: spokenTextWithTagsRemoved) {
-                spokenTextWithTagsRemoved.removeSubrange(tagRange)
-            }
-        }
-        let spokenText = spokenTextWithTagsRemoved.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Collect coordinate tags in document order. [POINT:none] matches have
-        // no captured x/y groups and contribute nothing.
         var points: [ParsedPointTag] = []
-        for tagMatch in allTagMatches {
-            guard tagMatch.numberOfRanges >= 3,
-                  let xRange = Range(tagMatch.range(at: 1), in: responseText),
-                  let yRange = Range(tagMatch.range(at: 2), in: responseText),
-                  let x = Double(responseText[xRange]),
-                  let y = Double(responseText[yRange]) else {
-                continue
-            }
+        if let regex = try? NSRegularExpression(pattern: coordinatePattern, options: [.caseInsensitive]) {
+            let fullTextRange = NSRange(responseText.startIndex..., in: responseText)
+            for tagMatch in regex.matches(in: responseText, range: fullTextRange) {
+                guard let xRange = Range(tagMatch.range(at: 1), in: responseText),
+                      let yRange = Range(tagMatch.range(at: 2), in: responseText),
+                      let x = Double(responseText[xRange]),
+                      let y = Double(responseText[yRange]) else {
+                    continue
+                }
 
-            var elementLabel: String? = nil
-            if tagMatch.numberOfRanges >= 4, let labelRange = Range(tagMatch.range(at: 3), in: responseText) {
-                elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
-            }
+                // Optional capture groups report NSNotFound when they didn't
+                // participate, and Range(_:in:) returns nil for those.
+                var elementLabel: String? = nil
+                if let labelRange = Range(tagMatch.range(at: 3), in: responseText) {
+                    let trimmedLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
+                    elementLabel = trimmedLabel.isEmpty ? nil : trimmedLabel
+                }
 
-            var screenNumber: Int? = nil
-            if tagMatch.numberOfRanges >= 5, let screenRange = Range(tagMatch.range(at: 4), in: responseText) {
-                screenNumber = Int(responseText[screenRange])
-            }
+                var screenNumber: Int? = nil
+                if let screenRange = Range(tagMatch.range(at: 4), in: responseText) {
+                    screenNumber = Int(responseText[screenRange])
+                }
 
-            points.append(ParsedPointTag(
-                coordinate: CGPoint(x: x, y: y),
-                elementLabel: elementLabel,
-                screenNumber: screenNumber
-            ))
+                points.append(ParsedPointTag(
+                    coordinate: CGPoint(x: x, y: y),
+                    elementLabel: elementLabel,
+                    screenNumber: screenNumber
+                ))
+            }
         }
+
+        // Strip EVERY [POINT...] fragment from the spoken text so a tag is never
+        // read aloud by TTS — coordinate tags, [POINT:none] in ANY casing or
+        // spacing ([POINT: none], [Point:None], ...), AND an unclosed trailing
+        // "[POINT:none" left when a generation is truncated mid-tag. The old
+        // parser stripped only an exact lowercase, closed [POINT:none], so any
+        // drift leaked into TTS (the model "saying" point none). This pass is
+        // deliberately broad but never crosses into another "[", so it removes
+        // one tag at a time, and it runs even when no coordinate tag matched.
+        var spokenText = responseText
+        let stripPattern = #"\[\s*POINTS?\s*:[^\[\]]*\]?"#
+        if let stripRegex = try? NSRegularExpression(pattern: stripPattern, options: [.caseInsensitive]) {
+            let fullTextRange = NSRange(spokenText.startIndex..., in: spokenText)
+            spokenText = stripRegex.stringByReplacingMatches(in: spokenText, options: [], range: fullTextRange, withTemplate: "")
+        }
+        spokenText = spokenText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         return PointingParseResult(
             spokenText: spokenText,

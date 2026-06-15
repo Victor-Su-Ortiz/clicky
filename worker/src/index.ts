@@ -30,15 +30,21 @@ interface Env {
   // and guides still use it). Leave unset unless TTS requests fail.
   MINIMAX_GROUP_ID?: string;
   ASSEMBLYAI_API_KEY: string;
-  // Which upstream serves /chat: "minimax" (default) or "together".
-  // Together is text-only until they ship MiniMax M3 (M2.7 has no vision),
-  // so flip this only for plumbing tests or once TOGETHER_CHAT_MODEL points
-  // at a vision-capable model.
+  // Which upstream serves /chat: "together" (active) or "minimax".
+  // Live on Together serverless M3 (MiniMaxAI/MiniMax-M3) as of 2026-06-14 —
+  // vision verified working with the base64 screenshots the app sends. The
+  // value is set in wrangler.toml; if unset here the code falls back to the
+  // MiniMax-direct path. Flip to "minimax" to revert to MiniMax-direct.
   CHAT_UPSTREAM?: string;
   TOGETHER_API_KEY?: string;
-  // Together serverless model id, e.g. "MiniMaxAI/MiniMax-M2.7". Change to
-  // the M3 id once Together lists it.
+  // Together serverless model id. Defaults to "MiniMaxAI/MiniMax-M3" — the
+  // vision model the app uses, now listed on Together serverless.
   TOGETHER_CHAT_MODEL?: string;
+  // Thinking mode for the Together M3 chat path: "disabled" (default — fastest,
+  // best for the real-time voice UX), "enabled", or "adaptive". Sent as
+  // chat_template_kwargs.thinking_mode. M3 is a reasoning model, so without
+  // this it reasons before every critique (filtered before TTS, but slower).
+  TOGETHER_THINKING_MODE?: string;
   // Which upstream serves /tts: "minimax" (default) or "together".
   // The Together path serves the same MiniMax speech model but requires a
   // RUNNING dedicated endpoint on the Together account (~$6.49/hr while up;
@@ -53,7 +59,7 @@ interface Env {
   TOGETHER_TTS_VOICE?: string;
 }
 
-const DEFAULT_TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7";
+const DEFAULT_TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M3";
 
 const TOGETHER_STT_MODEL = "nvidia/parakeet-tdt-0.6b-v3";
 
@@ -169,7 +175,8 @@ async function handleChatViaTogether(anthropicBodyText: string, env: Env): Promi
   }
 
   const togetherModelId = env.TOGETHER_CHAT_MODEL || DEFAULT_TOGETHER_CHAT_MODEL;
-  const openAIRequest = anthropicToOpenAIChatRequest(anthropicRequest, togetherModelId);
+  const togetherThinkingMode = env.TOGETHER_THINKING_MODE || "disabled";
+  const openAIRequest = anthropicToOpenAIChatRequest(anthropicRequest, togetherModelId, togetherThinkingMode);
 
   const response = await fetch("https://api.together.xyz/v1/chat/completions", {
     method: "POST",
@@ -228,6 +235,8 @@ interface OpenAIChatRequest {
   max_tokens?: number;
   stream: boolean;
   messages: Array<{ role: string; content: unknown }>;
+  // vLLM/OpenAI-compatible passthrough Together uses to toggle M3's reasoning.
+  chat_template_kwargs?: { thinking_mode: string };
 }
 
 interface OpenAIChatResponse {
@@ -242,7 +251,8 @@ interface OpenAIChatResponse {
  */
 export function anthropicToOpenAIChatRequest(
   anthropicRequest: AnthropicChatRequest,
-  togetherModelId: string
+  togetherModelId: string,
+  thinkingMode?: string
 ): OpenAIChatRequest {
   const openAIMessages: Array<{ role: string; content: unknown }> = [];
 
@@ -275,12 +285,21 @@ export function anthropicToOpenAIChatRequest(
     openAIMessages.push({ role: message.role, content: openAIContentParts });
   }
 
-  return {
+  const openAIRequest: OpenAIChatRequest = {
     model: togetherModelId,
     max_tokens: anthropicRequest.max_tokens,
     stream: anthropicRequest.stream === true,
     messages: openAIMessages,
   };
+
+  // M3 reasons by default; disable it (or set enabled/adaptive) via the
+  // vLLM-style chat_template_kwargs so reasoning latency stays out of the
+  // spoken critique. Only sent when a mode is configured.
+  if (typeof thinkingMode === "string" && thinkingMode.length > 0) {
+    openAIRequest.chat_template_kwargs = { thinking_mode: thinkingMode };
+  }
+
+  return openAIRequest;
 }
 
 /**

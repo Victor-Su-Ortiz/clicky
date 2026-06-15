@@ -23,34 +23,32 @@ Speech-to-text defaults to **NVIDIA Parakeet on Together AI** (`VoiceTranscripti
 
 ## Which chat API is Clicky using?
 
-**MiniMax, unchanged.** The Together AI **chat** upstream is still dormant (`CHAT_UPSTREAM = "minimax"`) — deploying the Worker for STT does not change the chat behavior at all.
+**Together AI serverless M3**, as of 2026-06-14 (`CHAT_UPSTREAM = "together"`, `TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M3"`, deployed version `25afb1f2`). Same M3 vision model as before, now served through Together's OpenAI-compatible endpoint with reasoning disabled for latency. Flip `CHAT_UPSTREAM` back to `"minimax"` + redeploy to return to MiniMax-direct. (TTS and STT unchanged.)
 
-## Together AI support (built, dormant, not deployed)
+## Together AI chat — LIVE (deployed 2026-06-14)
 
-The local `worker/` code now supports Together as an alternate `/chat` upstream, controlled by `CHAT_UPSTREAM` in `worker/wrangler.toml`:
+`/chat` now runs on Together's serverless MiniMax M3 (`MiniMaxAI/MiniMax-M3` — $0.30/1M in · $0.06/1M cached · $1.20/1M out, ~524K ctx), controlled by `CHAT_UPSTREAM` in `worker/wrangler.toml`. The app never changes — the Worker translates Anthropic ⇄ OpenAI internally and the app always sees Anthropic Messages format.
 
-- `CHAT_UPSTREAM = "minimax"` (current value) → exact same verbatim passthrough to `api.minimax.io` as before. The Together path is completely dormant.
-- The app never changes either way — the Worker translates Anthropic ⇄ OpenAI formats internally.
+**Verified live (2026-06-14, deployed version `25afb1f2`):**
 
-**Why not switched yet:** Together only serves MiniMax M2.7, which is **text-only** (no screenshots → Clicky's core flow can't work). MiniMax M3 (the vision model Clicky uses) is listed as "coming soon" on https://www.together.ai/models/minimax-m3.
+- **Vision works with base64 `data:` URLs** — exactly what the app sends. Tested through the deployed Worker `/chat` in the app's Anthropic format (system + text + base64 image, streaming): returned clean `content_block_delta`/`text_delta` events, a single `[DONE]`, no `<think>` leak, and an accurate description of the test image. (Earlier "I don't see an image" replies were only for tiny featureless solid-color test images — a model quirk, not a vision failure. A real photo / a webpage screenshot is described correctly.)
+- **Reasoning isolation** — M3 streams reasoning in a separate `delta.reasoning` field, which the Worker already ignores (it forwards only `delta.content`). No reasoning reaches TTS.
+- **Thinking disabled for latency** — `TOGETHER_THINKING_MODE = "disabled"` makes the Worker send `chat_template_kwargs:{"thinking_mode":"disabled"}` (verified: reasoning tokens → 0). Set it to `"enabled"`/`"adaptive"` to turn reasoning back on. NB: the `{"thinking": false}` variant does NOT work — only `thinking_mode` does.
 
-**Deploying the new Worker is safe whenever** (no behavior change while `CHAT_UPSTREAM = "minimax"`):
+**Revert to MiniMax-direct** anytime: set `CHAT_UPSTREAM = "minimax"` in `wrangler.toml`, then `cd worker && npx wrangler deploy`. TTS always stays on MiniMax (Together doesn't host their speech model serverless), so keep `MINIMAX_API_KEY` set regardless.
 
-```bash
-cd worker && npx wrangler deploy
-```
-
-**To switch to Together later** (once M3 is live on Together):
+**Re-check vision later** (e.g. if Together changes the deployment) — send a real image, not a solid color:
 
 ```bash
-cd worker
-npx wrangler secret put TOGETHER_API_KEY     # paste Together key
-# edit wrangler.toml: CHAT_UPSTREAM = "together"
-#                     TOGETHER_CHAT_MODEL = "<M3 model id from Together>"
-npx wrangler deploy
+KEY=$(grep '^TOGETHER_API_KEY=' worker/.dev.vars | cut -d= -f2-)
+curl -sL https://picsum.photos/id/237/400/300.jpg -o /tmp/img.jpg
+B64=$(base64 < /tmp/img.jpg | tr -d '\n')
+curl -s https://api.together.xyz/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"MiniMaxAI/MiniMax-M3","max_tokens":60,"messages":[{"role":"user","content":[{"type":"text","text":"Describe this image."},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,'"$B64"'"}}]}]}'
 ```
 
-Flip back anytime by reverting `CHAT_UPSTREAM` to `"minimax"` and redeploying. TTS always stays on MiniMax (Together doesn't host their speech model), so keep `MINIMAX_API_KEY` set regardless.
+A real description → vision OK.
 
 ## Other loose ends
 

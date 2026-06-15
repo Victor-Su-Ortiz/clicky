@@ -5,12 +5,17 @@ workers_dev = true
 
 [vars]
 MINIMAX_VOICE_ID = "English_FriendlyPerson"
-# Which upstream serves /chat: "minimax" (default) or "together".
-# Together is text-only until they list MiniMax M3 (M2.7 has no vision) —
-# flip to "together" and update TOGETHER_CHAT_MODEL once M3 is live, then
-# `npx wrangler deploy`. Requires the TOGETHER_API_KEY secret.
-CHAT_UPSTREAM = "minimax"
-TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M2.7"
+# Which upstream serves /chat: "minimax" or "together".
+# LIVE on Together serverless M3 (MiniMaxAI/MiniMax-M3) as of 2026-06-14 —
+# vision verified working with the base64 screenshots the app sends (see
+# NOTES.md). Flip back to "minimax" + redeploy to revert to MiniMax-direct.
+# Requires the TOGETHER_API_KEY secret.
+CHAT_UPSTREAM = "together"
+TOGETHER_CHAT_MODEL = "MiniMaxAI/MiniMax-M3"
+# Thinking mode for the Together M3 path: "disabled" (fastest, for the voice
+# UX), "enabled", or "adaptive". M3 reasons by default; disabled keeps the
+# reasoning latency out of the spoken critique.
+TOGETHER_THINKING_MODE = "disabled"
 # Which upstream serves /tts: "minimax" (default) or "together".
 # The Together path serves the SAME MiniMax speech model but needs a RUNNING
 # dedicated endpoint on the Together account first (~$6.49/hr while up —
